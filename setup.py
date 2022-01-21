@@ -7,7 +7,7 @@ setuptools.setup(
     name="CiberATAC",
     version="0.0.1",
     author="Mehran Karimzadeh",
-    author_email="mehran.karimzadeh@vectorinstitute.ai",
+    author_email="mehran.karimzadeh@uhnresearch.ca",
     description="Deep learning model for deconvolving chromatin accessibility data",
     long_description=long_description,
     long_description_content_type="text/markdown",

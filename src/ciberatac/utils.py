@@ -16,6 +16,18 @@ else:
     device = torch.device("cpu")
 
 
+def extract_weights(net):
+    list_dicts = []
+    for param_name, param_val in net.named_parameters():
+        dict_weights = {}
+        dict_weights["Values"] = param_val.detach().cpu().numpy().reshape(-1)
+        dict_weights["Name"] = [param_name] * len(dict_weights["Values"])
+        addf = pd.DataFrame(dict_weights)
+        list_dicts.append(addf)
+    outdf = pd.concat(list_dicts)
+    return outdf
+
+
 def get_bce(response_ar, pred_vals, regions, resp_cutoff=0, bce=True):
     response_ar = response_ar.reshape(response_ar.shape[0], 1)
     pred_vals = pred_vals.reshape(pred_vals.shape[0], 1)
@@ -330,22 +342,20 @@ def make_adname(modelparams):
         modelparams["filter_rate"],
         int(modelparams["kernel_size"]))
     adname = adname +\
-        "_D_{}_Pool_{}_{}_{}_lr_{}".format(
+        "_D_{}_Pool_{}_lr_{}".format(
             "_".join(
                 [str(each) for each in modelparams["dilations"]]),
-            modelparams["pool_type"],
             modelparams["pool_dim"],
-            modelparams["activation"],
             modelparams["lr"])
     adname = adname +\
         "s_{}__{}_Aug_{}".format(
             modelparams["stride"],
             modelparams["optimizer"],
             "-".join(augmentations))
-    adname = adname +\
-        "_DP_{}".format(modelparams["dropout"])
-    if modelparams["normtype"] != "BatchNorm":
-        adname = adname + "_{}".format(modelparams["normtype"])
+    # adname = adname +\
+    #     "_DP_{}".format(modelparams["dropout"])
+    # if modelparams["normtype"] != "BatchNorm":
+    #     adname = adname + "_{}".format(modelparams["normtype"])
     if modelparams["regularize"]:
         if modelparams["ltype"] in [1, 2]:
             adname = adname +\
@@ -360,24 +370,26 @@ def make_adname(modelparams):
                 "_l1Andl2_{}".format(modelparams["lambda_param"])
         else:
             raise ValueError("--ltype > 4 not supported")
-    if modelparams.get("regression", False):
-        adname = adname + "_regression"
-    if "SCALE" in modelparams.keys():
-        scale_str = "-".join(
-            [str(each) for each in modelparams["SCALE"]])
-        scale_str = scale_str + "-{}".format(modelparams["SCALE_OP"])
-        adname = adname + "_{}".format(scale_str)
-    if "LOSS_SCALERS" in modelparams.keys():
-        scale_str = "-".join(
-            [str(each) for each in modelparams["LOSS_SCALERS"]])
-        adname = adname + "_{}".format(scale_str)
-    if "RESP_THRESH" in modelparams.keys():
-        ad_str = "Resp.Quantile.{}".format(
-            modelparams["RESP_THRESH"])
-        adname = adname + "_{}".format(ad_str)
+    # if "SCALE" in modelparams.keys():
+    #     scale_str = "-".join(
+    #         [str(each) for each in modelparams["SCALE"]])
+    #     scale_str = scale_str + "-{}".format(modelparams["SCALE_OP"])
+    #     adname = adname + "_{}".format(scale_str)
+    # if "LOSS_SCALERS" in modelparams.keys():
+    #     scale_str = "-".join(
+    #         [str(each) for each in modelparams["LOSS_SCALERS"]])
+    #     adname = adname + "_{}".format(scale_str)
+    # if "RESP_THRESH" in modelparams.keys():
+    #     ad_str = "Resp.Quantile.{}".format(
+    #         modelparams["RESP_THRESH"])
+    #     adname = adname + "_{}".format(ad_str)
     if "arcsinh" in modelparams.keys():
         adname = adname + "_{}{}".format(
             "arcsinh", modelparams["arcsinh"])
+    if "input_normalize" in modelparams.keys():
+        adname = adname + "_{}-{}".format(
+            "normalizeInput",
+            modelparams["input_normalize"])
     return adname
 
 

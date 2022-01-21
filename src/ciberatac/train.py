@@ -13,6 +13,8 @@ import pandas as pd
 import pyBigWig
 from scipy import stats
 from sklearn import metrics
+from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import MinMaxScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -243,9 +245,10 @@ class DataHandler:
                  dont_train=False,
                  SCALE_FACTORS=[1, 1],
                  SCALE_OP="identity", arcsinh=False,
-                 seed=42):
+                 seed=42, input_normalize="None"):
         self.SCALE_FACTORS = SCALE_FACTORS
         self.SCALE_OP = SCALE_OP
+        self.input_normalize = input_normalize
         self.arcsinh = arcsinh
         self.prepared_bigwigs = False
         self.dont_train = dont_train
@@ -259,7 +262,38 @@ class DataHandler:
         self.bulkdnasepath = bulkdnasepath
         self.bedpath = bedpath
         self.mask_nonpeaks = mask_nonpeaks
+        self.make_normalizers()
         self.load_bed()
+
+    def make_normalizers(self, sample_chrom="chr1"):
+        bw_paths = [
+            self.rnabwpaths[0], self.dnasebwpaths[0], self.bulkdnasepath]
+        list_regions = []
+        for each_bw in bw_paths:
+            bw_cur = pyBigWig.open(each_bw)
+            if sample_chrom not in bw_cur.chroms().keys():
+                sample_chrom = sample_chrom.replace("chr", "")
+            cur_vals = bw_cur.values(
+                sample_chrom, 0, bw_cur.chroms()[sample_chrom],
+                numpy=True)
+            cur_vals[np.isnan(cur_vals)] = 0
+            cur_vals = cur_vals[cur_vals > 0]
+            cur_vals = cur_vals.reshape(-1)
+            idx_high = np.where(cur_vals > 100)[0]
+            if len(idx_high) > 0:
+                cur_vals[idx_high] = 100 + np.sqrt(cur_vals[idx_high])
+            list_regions.append(cur_vals)
+        curvals = list_regions[0]
+        for i in range(1, len(list_regions)):
+            curvals = np.concatenate((curvals, list_regions[i]))
+        curvals = curvals.reshape(-1, 1)
+        print(curvals.shape)
+        if self.input_normalize == "RobustScaler":
+            self.RobustScaler = RobustScaler().fit(curvals)
+        elif self.input_normalize == "MinMaxScaler":
+            self.MinMaxScaler = MinMaxScaler(
+                feature_range=(0, 100)).fit(curvals)
+        print("Set scaler according to {}".format(self.input_normalize))
 
     def get_min_max(self, bwpath):
         bw = pyBigWig.open(self.refrnabwpath)
@@ -317,6 +351,7 @@ class DataHandler:
         return rna, dnase, midpos, avg_mid, response
 
     def scale_signal(self, signal):
+        signal = self.normalize_input(signal)
         if self.SCALE_OP == "identity":
             return signal
         elif self.SCALE_OP == "sqrt":
@@ -365,6 +400,7 @@ class DataHandler:
                     signal = bwobj.values(
                         chrom_temp, start, end, numpy=True)
                     signal = signal * SCALE_FACTOR
+                    signal[np.isnan(signal)] = 0
                     signal = self.scale_signal(signal)
                     # signal = chrom_signal[start:end]
                 except Exception:
@@ -400,11 +436,42 @@ class DataHandler:
             avg_vals = np.arcsinh(avg_vals)
         return batchar, avg_vals
 
-    def get_region_poses(self, max_num=2400):
-        num_variants = 700  # 600
-        num_random = 400
+    def normalize_input(self, batchar):
+        idx_nonzero = np.where(batchar > 0)
+        if len(batchar.shape) == 3:
+            idx_nonzero = np.where(batchar > 0.1)
+        if len(idx_nonzero[0]) > 0:
+            curvals = batchar[idx_nonzero].reshape(-1, 1)
+            if self.input_normalize == "RobustScaler":
+                if not hasattr(self, self.input_normalize):
+                    self.RobustScaler = RobustScaler().fit(curvals)
+                newvals = self.RobustScaler.transform(curvals)
+            elif self.input_normalize == "MinMaxScaler":
+                if not hasattr(self, self.input_normalize):
+                    self.MinMaxScaler = MinMaxScaler().fit(curvals)
+                newvals = self.MinMaxScaler.transform(curvals)
+            elif self.input_normalize == "None":
+                newvals = curvals
+            else:
+                print("{} not recognized".format(self.input_normalize))
+                raise ValueError("MinMaxScaler not recognizer, check logs")
+            if np.min(newvals) < 0.1:
+                if len(batchar.shape) == 3:
+                    newvals = newvals - min(newvals) + 0.1
+                elif np.min(newvals) < 0:
+                    newvals = newvals - min(newvals)
+            batchar[idx_nonzero] = newvals.reshape(-1)
+        return batchar
+
+    def get_region_poses(self, num_variants=700, num_random=400):
+        # num_variants = 700  # 600
+        # num_random = 400
         # cutoff_0 = np.quantile(self.bed["Bulk.Signal"], 0.05)
         # num_pos_1 = int(max_num / 2)
+        if num_variants + num_random > self.bed.shape[0]:
+            ratio_regs = float(num_variants) / num_random
+            num_variants = int(ratio_regs * self.bed.shape[0])
+            num_random = self.bed.shape[0] - num_variants
         cutoff_0 = 0
         tempdf = self.bed.iloc[
             np.where(self.bed["Bulk.Signal"] > cutoff_0)[0],
@@ -694,7 +761,7 @@ def make_default_args():
     return list_args
 
 
-def get_remaining(logdir, train_chroms, maxepoch):
+def get_remaining(logdir, train_chroms, maxepoch, lr=0.001):
     # maxepoch = 15
     idxchrom = 0
     rm_epochs = list(range(maxepoch))
@@ -705,19 +772,20 @@ def get_remaining(logdir, train_chroms, maxepoch):
         if "Model_at_" in each]
     for each in perfpaths:
         modstr = each.split(".pt")[0]
-        modstr = modstr.replace(" Model_at_", "")
+        modstr = modstr.replace("Model_at_", "")
         used_chroms.extend(modstr.split("_"))
     rm_chroms = list(set(train_chroms) - set(used_chroms))
+    rm_chroms.sort()
 
     # Not get the last epoch
     for i in range(len(train_chroms)):
         logpath = os.path.join(
             logdir,
-            "modelLogUnSharednnn_lr0.001_macrobatch{}.tsv".format(i))
+            "modelLogUnSharednnn_lr{}_macrobatch{}.tsv".format(lr, i))
         if not os.path.exists(logpath):
             j = i - 1
             if j >= 0:
-                adstr = "modelLogUnSharednnn_lr0.001"
+                adstr = "modelLogUnSharednnn_lr{}".format(lr)
                 logpath = os.path.join(
                     logdir,
                     "{}_macrobatch{}.tsv".format(
@@ -729,6 +797,9 @@ def get_remaining(logdir, train_chroms, maxepoch):
                     rm_epochs = list(
                         range(last_epoch, maxepoch))
                     idxchrom = i
+                    if last_epoch > 30:
+                        rm_epochs = list(range(maxepoch))
+                        idxchrom = i + 1
     return rm_chroms, rm_epochs, idxchrom
 
 
@@ -1226,7 +1297,8 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
             checkpoint = {
                 'model': net.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'amp': amp.state_dict()
+                'amp': amp.state_dict(),
+                "modelparams": modelparams
             }
             torch.save(
                 checkpoint,
@@ -1246,7 +1318,8 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
             checkpoint = {
                 'model': net.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'amp': amp.state_dict()
+                'amp': amp.state_dict(),
+                "modelparams": modelparams
             }
             torch.save(checkpoint, modelpath_bestloss)
             for chkpath in chkpaths:
@@ -1272,7 +1345,8 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
     checkpoint = {
         'model': net.state_dict(),
         'optimizer': optimizer.state_dict(),
-        'amp': amp.state_dict()
+        'amp': amp.state_dict(),
+        "modelparams": modelparams
     }
     torch.save(checkpoint, modelpath_chorm)
     idxchrom += 1
@@ -1358,8 +1432,8 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
          train_general=False, loss_scalers=[1.0, 1.0, 1.0, 1.0],
          main_loss="SmoothL1", pretrained_path="NA",
          vae_names="NA", arcsinh=False, respdiff=False,
-         augmentations=[]):
-    num_concurrent_chroms = 4
+         augmentations=[], num_contrastive_regions=[700, 400],
+         num_chroms_per_batch=4, input_normalize="None"):
     if vae_names == "NA":
         vae_names = process_vae_names(["NA"], rnabwpaths)
     dictpaths = compile_paths(outdir, modelparams)
@@ -1380,7 +1454,7 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
         outdir, "modelLog", adname)
     os.makedirs(logdir, exist_ok=True)
     rm_chroms, rm_epochs, idxchrom = get_remaining(
-        logdir, train_chroms, maxepoch)
+        logdir, train_chroms, maxepoch, modelparams["lr"])
     rm_chroms.sort()
     if main_loss == "SmoothL1":
         criterion = torch.nn.SmoothL1Loss().to(device)
@@ -1391,11 +1465,11 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
     criterion_ce = nn.CrossEntropyLoss().to(device)
     if dont_train:
         rm_chroms = train_chroms
-    num_chrom_parts = int(len(rm_chroms) / num_concurrent_chroms)
+    num_chrom_parts = int(len(rm_chroms) / num_chroms_per_batch)
     for idx_chrom in range(num_chrom_parts):
-        idx_chrom_st = idx_chrom * num_concurrent_chroms
+        idx_chrom_st = idx_chrom * num_chroms_per_batch
         idx_chrom_end = min(
-            [len(rm_chroms), (idx_chrom + 1) * num_concurrent_chroms])
+            [len(rm_chroms), (idx_chrom + 1) * num_chroms_per_batch])
         cur_chroms = rm_chroms[idx_chrom_st:idx_chrom_end]
         list_tensordicts = []
         list_resp_cutoffs = []
@@ -1410,7 +1484,9 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
                 SCALE_FACTORS=SCALE_FACTORS,
                 SCALE_OP=scale_operation,
                 RESP_THRESH=resp_thresh,
-                vae_names=vae_names, arcsinh=arcsinh)
+                vae_names=vae_names, arcsinh=arcsinh,
+                num_contrastive_regions=num_contrastive_regions,
+                input_normalize=input_normalize)
             list_tensordicts.append(tensordict_chrom)
             list_resp_cutoffs.append(resp_cutoff)
             bed_temp.to_csv(
@@ -1447,10 +1523,11 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
                 logdir, "{}_fullChromPerf_{}.tsv.gz".format(
                     chrom_str, cur_chroms[0]))
             main_predict(outpath_pred, rnabwpaths[0], bulkdnasepath,
-                         bedpath, "NA", "NA", modelpath_bestloss, 16, seqdir,
+                         bedpath, dnasebwpaths[0], rnabwpaths[0],
+                         modelpath_bestloss, 16, seqdir,
                          False, scvipath, vae_names[0],
                          dnasebwpaths[0], SCALE_FACTORS, scale_operation,
-                         chrom=cur_chroms[0])
+                         chrom=cur_chroms[0], input_normalize=input_normalize)
         idxchrom += 1
         del tensordict_all
         torch.cuda.empty_cache()
@@ -1485,7 +1562,9 @@ def get_batch(rnabwpaths,
               SCALE_OP="identity",
               RESP_THRESH=0.2,
               vae_names=["NA"],
-              num_scvi_samples=32, arcsinh=False):
+              num_scvi_samples=32, arcsinh=False,
+              num_contrastive_regions=[700, 400],
+              input_normalize="None"):
     if vae_names[0] == "NA":
         vae_names = process_vae_names(vae_names, rnabwpaths)
     # SCALE_FACTORS = get_scale_factors(
@@ -1498,10 +1577,13 @@ def get_batch(rnabwpaths,
         force_tissue_negatives=force_tissue_negatives,
         dont_train=dont_train,
         SCALE_FACTORS=SCALE_FACTORS,
-        SCALE_OP=SCALE_OP, arcsinh=arcsinh)
+        SCALE_OP=SCALE_OP, arcsinh=arcsinh,
+        input_normalize=input_normalize)
     DataObj.get_batch_nums(chrom, batchsize)
     resp_cutoff = DataObj.annotate_bed(SCALE_FACTORS[1])
-    regions_to_use = DataObj.get_region_poses(2400)
+    regions_to_use = DataObj.get_region_poses(
+        num_contrastive_regions[0],
+        num_contrastive_regions[1])
     num_batches = int(regions_to_use.shape[0] / batchsize / 1)
     TOTBATCHIDX = num_batches * len(rnabwpaths) * batchsize
     NUMPARTS = int(regions_to_use.shape[0] / batchsize)
@@ -1660,7 +1742,8 @@ def adjust_model_params(args):
         "RESP_THRESH": args.resp_thresh,
         "arcsinh": args.arcsinh,
         "respdiff": args.respdiff,
-        "augmentations": args.augmentations}
+        "augmentations": args.augmentations,
+        "input_normalize": args.input_normalize}
     return modelparams
 
 
@@ -1899,7 +1982,36 @@ if __name__ == "__main__":
         action="store_true",
         help="If specified, train on difference from bulk "
         "instead of the actual response.")
+    parser.add_argument(
+        "--num-contrastive-regions",
+        default=[700, 400],
+        type=int,
+        nargs="*",
+        help="Two integers; first one the number of regions "
+        "to sample from the most variant regions, and the "
+        "second one as the number of regions to sample from "
+        "other genomic regions")
+    parser.add_argument(
+        "--maxepoch",
+        type=int,
+        default=100,
+        help="Maximum epochs")
+    parser.add_argument(
+        "--num-chroms-per-batch",
+        help="Number of chromosomes to use for obtaining "
+        "data of one batch; large numbers may result "
+        "in memory crash. 1--4 suggested",
+        default=4,
+        type=int)
+    parser.add_argument(
+        "--input-normalize",
+        default="None",
+        choices=["None", "RobustScaler", "MinMaxScaler", "arcsinh"],
+        help="One of None, RobustScaler, or MinMaxScaler.")
     args = parser.parse_args()
+    if args.input_normalize == "arcsinh":
+        args.acsinh = True
+        args.input_normalize = "None"
     print(args)
     vae_names = process_vae_names(args.vae_names, args.rnabwpaths)
     print(args)
@@ -1926,5 +2038,8 @@ if __name__ == "__main__":
          main_loss=args.main_loss,
          pretrained_path=args.pretrained_path,
          vae_names=vae_names, arcsinh=args.arcsinh,
-         respdiff=args.respdiff,
-         augmentations=args.augmentations)
+         respdiff=args.respdiff, maxepoch=args.maxepoch,
+         augmentations=args.augmentations,
+         num_contrastive_regions=args.num_contrastive_regions,
+         num_chroms_per_batch=args.num_chroms_per_batch,
+         input_normalize=args.input_normalize)

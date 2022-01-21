@@ -6,6 +6,8 @@ from collections import OrderedDict
 from train import scale_down
 from model import ResNet1D
 from model import ResidualBlock
+from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import MinMaxScaler
 import gzip
 import numpy as np
 import os
@@ -16,6 +18,7 @@ from sklearn import metrics
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from utils import extract_weights
 
 
 device = torch.device("cuda:0")
@@ -27,9 +30,11 @@ class DataHandler:
                  bedpath, seqdir, refdnasebwpath="NA",
                  refrnabwpath="NA", window=10000,
                  mask_nonpeaks=False, SCALE_FACTORS=[1, 1],
-                 SCALE_OP="identity", arcsinh=False):
+                 SCALE_OP="identity", arcsinh=False,
+                 input_normalize="None"):
         self.prepared_bigwigs = False
         self.arcsinh = arcsinh
+        self.input_normalize = input_normalize
         self.SCALE_FACTORS = SCALE_FACTORS
         self.SCALE_OP = SCALE_OP
         self.nucs = np.array(["A", "T", "C", "G"])
@@ -41,7 +46,39 @@ class DataHandler:
         self.refdnasebwpath = refdnasebwpath
         self.refrnabwpath = refrnabwpath
         self.mask_nonpeaks = mask_nonpeaks
+        self.make_normalizers()
         self.load_bed()
+
+    def make_normalizers(self, sample_chrom="chr1"):
+        bw_paths = [
+            self.dnasebwpath, self.refdnasebwpath, self.refrnabwpath]
+        bw_paths = [each for each in bw_paths if os.path.exists(each)]
+        list_regions = []
+        for each_bw in bw_paths:
+            bw_cur = pyBigWig.open(each_bw)
+            if sample_chrom not in bw_cur.chroms().keys():
+                sample_chrom = sample_chrom.replace("chr", "")
+            cur_vals = bw_cur.values(
+                sample_chrom, 0, bw_cur.chroms()[sample_chrom],
+                numpy=True)
+            cur_vals[np.isnan(cur_vals)] = 0
+            cur_vals = cur_vals[cur_vals > 0]
+            cur_vals = cur_vals.reshape(-1)
+            idx_high = np.where(cur_vals > 100)[0]
+            if len(idx_high) > 0:
+                cur_vals[idx_high] = 100 + np.sqrt(cur_vals[idx_high])
+            list_regions.append(cur_vals)
+        curvals = list_regions[0]
+        for i in range(1, len(list_regions)):
+            curvals = np.concatenate((curvals, list_regions[i]))
+        curvals = curvals.reshape(-1, 1)
+        print(curvals.shape)
+        if self.input_normalize == "RobustScaler":
+            self.RobustScaler = RobustScaler().fit(curvals)
+        elif self.input_normalize == "MinMaxScaler":
+            self.MinMaxScaler = MinMaxScaler(
+                feature_range=(0, 100)).fit(curvals)
+        print("Set scaler according to {}".format(self.input_normalize))
 
     def get_min_max(self, bwpath):
         bw = pyBigWig.open(self.refrnabwpath)
@@ -57,6 +94,33 @@ class DataHandler:
         minval = np.min(bwvals[bwvals > 0])
         meanval = np.mean(bwvals[bwvals > 0])
         return minval, maxval, meanval
+
+    def normalize_input(self, batchar):
+        idx_nonzero = np.where(batchar > 0)
+        if len(batchar.shape) == 3:
+            idx_nonzero = np.where(batchar > 0.1)
+        if len(idx_nonzero[0]) > 0:
+            curvals = batchar[idx_nonzero].reshape(-1, 1)
+            if self.input_normalize == "RobustScaler":
+                if not hasattr(self, self.input_normalize):
+                    self.RobustScaler = RobustScaler().fit(curvals)
+                newvals = self.RobustScaler.transform(curvals)
+            elif self.input_normalize == "MinMaxScaler":
+                if not hasattr(self, self.input_normalize):
+                    self.MinMaxScaler = MinMaxScaler().fit(curvals)
+                newvals = self.MinMaxScaler.transform(curvals)
+            elif self.input_normalize == "None":
+                newvals = curvals
+            else:
+                print("{} not recognized".format(self.input_normalize))
+                raise ValueError("MinMaxScaler not recognizer, check logs")
+            if np.min(newvals) < 0.1:
+                if len(batchar.shape) == 3:
+                    newvals = newvals - min(newvals) + 0.1
+                elif np.min(newvals) < 0:
+                    newvals = newvals - min(newvals)
+            batchar[idx_nonzero] = newvals.reshape(-1)
+        return batchar
 
     def process_background(self):
         # Generate minimum and maximum values
@@ -119,11 +183,11 @@ class DataHandler:
             chrom_signal = bw.values(
                 self.chrom.replace("chr", ""), 0, chromsize, numpy=True)
         chrom_signal[np.isnan(chrom_signal)] = 0
-        if os.path.exists(self.refdnasebwpath):
-            if os.path.exists(self.refrnabwpath):
-                adjust_mean_factor = \
-                    meanval / np.mean(chrom_signal[chrom_signal > 0])
-                chrom_signal = chrom_signal * adjust_mean_factor
+        # if os.path.exists(self.refdnasebwpath):
+        #     if os.path.exists(self.refrnabwpath):
+        #         adjust_mean_factor = \
+        #             meanval / np.mean(chrom_signal[chrom_signal > 0])
+        #         chrom_signal = chrom_signal * adjust_mean_factor
         # idx_nonzero = np.where(chrom_signal > 0)[0]
         # values_adjust = chrom_signal[idx_nonzero]
         # new_values = match_dist_motor(values_adjust, minval, maxval)
@@ -131,6 +195,7 @@ class DataHandler:
         chrom_signal = chrom_signal * scale_factor
         if self.arcsinh:
             chrom_signal = np.arcsinh(chrom_signal)
+        chrom_signal = self.normalize_input(chrom_signal)
         chrom_signal = scale_down(chrom_signal)
         bw.close()
         return chrom_signal
@@ -294,12 +359,16 @@ def get_optimizer(optname, net, lr):
     elif optname == "Adagrad":
         optimizer = optim.Adagrad(
             net.parameters(), lr=lr*10)
+    elif optname == "Adam":
+        optimizer = optim.Adam(
+            net.parameters(), lr=lr)
     else:
         raise ValueError("optimizer name not recognized")
     return optimizer
 
 
 def load_model(modelpath, regression=True):
+    checkpoint = torch.load(modelpath)
     modelparams = {
         "optimize": "train",
         "dropout": 0.5,
@@ -315,12 +384,15 @@ def load_model(modelpath, regression=True):
         "pool_dim": 40,
         "pool_type": "Average",
         "activation": "LeakyReLU",
-        "optimizer": "Adabound",
+        "optimizer": "Adam",
         "window": 20000,
         "normtype": "BatchNorm",
         "regularize": True,
         "lambda_param": 0.01,
         "augmentations": []}
+    modelparams_loaded = checkpoint.get("modelparams", {})
+    if "convparam" in modelparams_loaded.keys():
+        modelparams = modelparams_loaded
     net = ResNet1D(
         ResidualBlock,
         modelparams["convparam"], dp=modelparams["dropout"],
@@ -336,10 +408,11 @@ def load_model(modelpath, regression=True):
         activation=modelparams["activation"],
         regression=modelparams["regression"])
     net.to(device)
+    param_df_before = extract_weights(net)
+    param_df_before["State"] = "Initialized"
     optimizer = get_optimizer(
         modelparams["optimizer"], net,
         modelparams["lr"])
-    checkpoint = torch.load(modelpath)
     net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
     state_dict = checkpoint['model']
     new_state_dict = OrderedDict()
@@ -350,7 +423,10 @@ def load_model(modelpath, regression=True):
     optimizer.load_state_dict(checkpoint['optimizer'])
     amp.load_state_dict(checkpoint['amp'])
     net.eval()
-    return net
+    param_df_after = extract_weights(net)
+    param_df_after["State"] = "Pre-trained"
+    param_df = pd.concat([param_df_before, param_df_after])
+    return net, param_df
 
 
 def make_default_args():
@@ -428,7 +504,7 @@ def make_default_args():
 
 def predict_motor(DataObj, chrom, batchsize, net, scvi_tensor,
                   regression):
-    num_batches = DataObj.get_batch_nums(chrom, batchsize)
+    num_batches = DataObj.get_batch_nums(chrom, batchsize) + 1
     beddf = DataObj.bed.copy()
     beddf["Central.Position"] = 0
     beddf["Average.DNase"] = 0
@@ -436,6 +512,8 @@ def predict_motor(DataObj, chrom, batchsize, net, scvi_tensor,
     for i in range(num_batches):
         idx_st = i * batchsize
         idx_end = (i + 1) * batchsize
+        if idx_st > beddf.shape[0]:
+            break
         if idx_end > beddf.shape[0]:
             idx_end = beddf.shape[0]
         curbatchsize = idx_end - idx_st
@@ -459,6 +537,31 @@ def predict_motor(DataObj, chrom, batchsize, net, scvi_tensor,
     return beddf
 
 
+def visualize_params(param_df, outdir):
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    outdir_params = os.path.join(outdir, "modelParams")
+    os.makedirs(outdir_params, exist_ok=True)
+    sns_plot = plt.figure(figsize=(16, 9))
+    sns.distplot(
+        np.array(
+            param_df[param_df["State"] == "Initialized"]["Values"]),
+        label="Initialized")
+    sns.distplot(
+        np.array(
+            param_df[param_df["State"] != "Initialized"]["Values"]),
+        label="Pre-trained")
+    plt.legend()
+    sns_plot.savefig(
+        os.path.join(outdir_params, "model_histogram.png"))
+    sns_plot.savefig(
+        os.path.join(outdir_params, "model_histogram.pdf"))
+    param_df.to_csv(
+        os.path.join(
+            outdir_params, "model_histogram.tsv.gz"),
+        sep="\t", compression="gzip")
+
+
 def main(outpath, rnabwpath, dnasebwpath,
          bedpath, refdnasebwpath,
          refrnabwpath, modelpath, batchsize, seqdir,
@@ -467,7 +570,9 @@ def main(outpath, rnabwpath, dnasebwpath,
          SCALERS=[1, 100], SCALE_OP="identity",
          regression=True, window=10000,
          early_stop=False, valid_chroms=False,
-         chrom="all", arcsinh=False):
+         chrom="all", arcsinh=False,
+         input_normalize="None"):
+    outdir = os.path.dirname(outpath)
     scvi = load_scvidf(scvipath)
     scvi_ar = np.zeros((batchsize, 10))
     scvi_ar[:, :] = scvi[scvi_name]
@@ -477,7 +582,8 @@ def main(outpath, rnabwpath, dnasebwpath,
     scvi_tensor = torch.from_numpy(
         scvi_ar).float().to(device)
     # print(scvi_tensor)
-    net = load_model(modelpath)
+    net, param_df = load_model(modelpath)
+    visualize_params(param_df, outdir)
     beddf = pd.read_csv(
         bedpath, compression="gzip", sep="\t", header=None)
     chroms = list(pd.unique(beddf.iloc[:, 0]))
@@ -500,14 +606,16 @@ def main(outpath, rnabwpath, dnasebwpath,
             window=window,
             mask_nonpeaks=mask_nonpeaks,
             SCALE_FACTORS=SCALERS,
-            SCALE_OP=SCALE_OP, arcsinh=arcsinh)
+            SCALE_OP=SCALE_OP, arcsinh=arcsinh,
+            input_normalize=input_normalize)
         beddf = predict_motor(
             DataObj, chrom, batchsize, net, scvi_tensor,
             regression)
+        list_beds.append(beddf)
+        beddf = pd.concat(list_beds)
         beddf.to_csv(
             outpath.replace(".tsv", "_incomplete.tsv"),
             sep="\t", compression="gzip", index=None)
-        list_beds.append(beddf)
         del DataObj
     beddf = pd.concat(list_beds)
     beddf.to_csv(
@@ -519,19 +627,19 @@ def main(outpath, rnabwpath, dnasebwpath,
         beddf["Response"] = 0
         bw = pyBigWig.open(annotate_bwpath)
         for i in range(beddf.shape[0]):
-            chrom, st, end = [beddf.iloc[i, j] for j in [0, 1, 2]]
-            st = int(st)
-            end = int(end)
-            # midpos = int(st + round((end - st) / 2))
-            # midpos = int(round(st + ((end - st) / 2)))
-            # Get the middle signal not st:end
+            # chrom, st, end = [beddf.iloc[i, j] for j in [0, 1, 2]]
+            # st = int(st)
+            chrom = beddf.iloc[i, 0]
+            midpos = beddf["Central.Position"].iloc[i]
+            st = midpos - 100
+            end = midpos + 100
             signalvals = bw.values(
                 chrom, st, end, numpy=True)
             signalvals[np.isnan(signalvals)] = 0
             if arcsinh:
                 signalvals = np.arcsinh(signalvals)
             # signalvals = signalvals[np.logical_not(np.isnan(signalvals))]
-            beddf.iloc[i, -1] = np.mean(signalvals) * SCALERS[1]
+            beddf.iloc[i, -1] = np.mean(signalvals * SCALERS[1])
         tempdf = beddf.dropna()
         beddf["R2.predictions"] = metrics.r2_score(
             tempdf["Response"], tempdf["CiberATAC.Prediction"])
@@ -662,7 +770,15 @@ if __name__ == "__main__":
         "--arcsinh",
         action="store_true",
         help="If specified, pass all input/outputs into np.arcsinh")
+    parser.add_argument(
+        "--input-normalize",
+        default="None",
+        choices=["None", "RobustScaler", "MinMaxScaler", "arcsinh"],
+        help="One of None, RobustScaler, or MinMaxScaler.")
     args = parser.parse_args()
+    if args.input_normalize == "arcsinh":
+        args.acsinh = True
+        args.input_normalize = "None"
     if os.path.exists(args.outpath):
         raise ValueError("Output exists, exiting!")
     # Check file existance
@@ -681,4 +797,5 @@ if __name__ == "__main__":
          args.scvi_name, annotate_bwpath=args.annotate_bwpath,
          SCALERS=args.scalers, SCALE_OP=args.scale_operation,
          early_stop=args.early_stop,
-         valid_chroms=args.valid_chroms, arcsinh=args.arcsinh)
+         valid_chroms=args.valid_chroms, arcsinh=args.arcsinh,
+         input_normalize=args.input_normalize)
