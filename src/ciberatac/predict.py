@@ -763,6 +763,11 @@ if __name__ == "__main__":
         help="If specified, limit to "
         "chr6 chr7 chr11 chr13 chr15 chr21 chr22 chrX")
     parser.add_argument(
+        "--chrom",
+        default="all",
+        help="If specified, will only predict for the specified "
+        "chromosome. By defauls is set to 'all'")
+    parser.add_argument(
         "--early-stop",
         action="store_true",
         help="If specified, will only predict on chr1")
@@ -798,4 +803,5 @@ if __name__ == "__main__":
          SCALERS=args.scalers, SCALE_OP=args.scale_operation,
          early_stop=args.early_stop,
          valid_chroms=args.valid_chroms, arcsinh=args.arcsinh,
-         input_normalize=args.input_normalize)
+         input_normalize=args.input_normalize,
+         chrom=args.chrom)

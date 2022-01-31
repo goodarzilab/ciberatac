@@ -57,7 +57,7 @@ python train.py $OUTDIR $MAVEPATH $BEDPATH --rnabwpaths ${RNAPATHS[@]} --dnasebw
 ```
 MAVEPATH=mave_data/VAE_mu-matrix.tsv.gz
 RNADIR=pbmc/rna
-ATACDIR=pbmc/dnase
+ATACDIR=pbmc/atac
 OUTDIR=pbmc/ciberAtacPredictions
 mkdir -p $OUTDIR
 CELLTYPES=(B-cells CD14+_Mono CD8+_T DC Memory_CD4+ Naive_CD4+_T Natural_killer)
@@ -71,16 +71,16 @@ do
     ATACPATHS+=($ATACDIR/$CELLTYPE\_treat_pileup.bigWig)
 done
 BEDPATH=pbmc/all_cells_peaks.narrowPeak.gz
-SEQDIR=pbmc/hg38_np
+SEQDIR=pbmc/np
 BULKATAC=$ATACDIR/all_cells_treat_pileup.bigWig
-MODELID=$(ls pbmc/trainedCiberAtac/modelLog | grep bestRmodel.pt | head -1)
-MODELPATH=pbmc/trainedCiberAtac/modelLog/$MODELID
+MODELID=$(ls pbmc/trainedCiberAtac/modelLog | grep Block | head -1)
+MODELPATH=pbmc/trainedCiberAtac/modelLog/$MODELID/$MODELID\_bestmodel.pt
 BATCHSIZE=24
 for i in {0..6}
 do
     OUTPATH=${OUTPATHS[$i]}
     RNAPATH=${RNAPATHS[$i]}
     SAMPLENAME=${CELLTYPES[$i]}
-    python predict.py $OUTPATH $SCVIPATH $RNAPATH $ATAC $BEDPATH --modelpath $MODELPATH --batchsize $BATCHSIZE --seqdir $SEQDIR --scvi-name ${CELLTYPES[$i]} --annotate-bwpath ${ATACPATHS[$i]} --valid-chroms --scalers 1 1
+    python predict.py $OUTPATH $MAVEPATH $RNAPATH $BULKATAC $BEDPATH --modelpath $MODELPATH --batchsize $BATCHSIZE --seqdir $SEQDIR --scvi-name ${CELLTYPES[$i]} --annotate-bwpath ${ATACPATHS[$i]} --chrom chr2 --scalers 1 1
 done
 ```
