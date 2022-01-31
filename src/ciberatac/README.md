@@ -17,7 +17,7 @@ Download the PBMC pseudobulk bigWig files from https://doi.org/10.5281/zenodo.58
 ```
 MAVEPATH=mave_data/VAE_mu-matrix.tsv.gz
 RNADIR=pbmc/rna
-ATACDIR=pbmc/dnase
+ATACDIR=pbmc/atac
 OUTDIR=pbmc/trainedCiberAtac
 mkdir -p $OUTDIR
 CELLTYPES=(B-cells Natural_killer CD14+_Mono DC)
@@ -29,7 +29,7 @@ do
     ATACPATHS+=($ATACDIR/$CELLTYPE\_treat_pileup.bigWig)
 done
 BEDPATH=pbmc/all_cells_peaks.narrowPeak.gz
-SEQDIR=pbmc/hg38_np
+SEQDIR=pbmc/np # numpy files corresponding to hg38 chromosomes
 BULKATAC=$ATACDIR/all_cells_treat_pileup.bigWig
 CONV="1.1.1"
 POOL=40
