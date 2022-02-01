@@ -32,7 +32,7 @@ from utils import compile_paths
 # from utils import motor_log
 
 
-device = torch.device("cuda:0")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 opt_level = 'O1'
 
 
@@ -673,7 +673,8 @@ def load_model(modelparams, chkpaths, regression=False):
     optimizer = get_optimizer(
         modelparams["optimizer"], net,
         modelparams["lr"])
-    net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
+    if torch.cuda.is_available():
+        net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
     for eachpath in chkpaths:
         if os.path.exists(eachpath):
             net, optimizer = load_model_from_file(eachpath, net, optimizer)
@@ -814,7 +815,8 @@ def load_model_from_file(chkpath, net, optimizer):
         new_state_dict[k] = v
     net.load_state_dict(new_state_dict)
     optimizer.load_state_dict(checkpoint['optimizer'])
-    amp.load_state_dict(checkpoint['amp'])
+    if torch.cuda.is_available():
+        amp.load_state_dict(checkpoint['amp'])
     print("Successfully loaded the model")
     return net, optimizer
 
@@ -1070,8 +1072,11 @@ def train_motor(tensordict, net, optimizer, tidx,
             (bceloss * torch.tensor(loss_scalers[3])))
     if modelparams["regularize"]:
         loss = regularize_loss(modelparams, net, loss)
-    with amp.scale_loss(loss, optimizer) as scaled_loss:
-        scaled_loss.backward()
+    if torch.cuda.is_available():
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
+    else:
+        loss.backward()
     optimizer.step()
     current_loss = reg_loss.item()
     running_loss += current_loss
@@ -1235,8 +1240,11 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
     resp_top = np.quantile(
         tensordict["Response"], 0.75)
     # MINIBATCH = 40 * torch.cuda.device_count()
-    MINIBATCH = len(np.unique(tensordict_all["Samples"])) *\
-        6 * torch.cuda.device_count()
+    if torch.cuda.is_available():
+        MINIBATCH = len(np.unique(tensordict_all["Samples"])) *\
+            6 * torch.cuda.device_count()
+    else:
+        MINIBATCH = 16
     dim_train = int((tensordict["DNase"].shape[0]) / MINIBATCH)
     base_r = -1
     base_loss = 1000
@@ -1297,9 +1305,10 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
             checkpoint = {
                 'model': net.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'amp': amp.state_dict(),
                 "modelparams": modelparams
             }
+            if torch.cuda.is_available():
+                checkpoint['amp'] = amp.state_dict()
             torch.save(
                 checkpoint,
                 modelpath_bestloss.replace(".pt", "-bestRmodel.pt"))
@@ -1318,9 +1327,10 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
             checkpoint = {
                 'model': net.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'amp': amp.state_dict(),
                 "modelparams": modelparams
             }
+            if torch.cuda.is_available():
+                checkpoint['amp'] = amp.state_dict()
             torch.save(checkpoint, modelpath_bestloss)
             for chkpath in chkpaths:
                 shutil.copyfile(modelpath_bestloss, chkpath)
@@ -1345,9 +1355,10 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
     checkpoint = {
         'model': net.state_dict(),
         'optimizer': optimizer.state_dict(),
-        'amp': amp.state_dict(),
         "modelparams": modelparams
     }
+    if torch.cuda.is_available():
+        checkpoint['amp'] = amp.state_dict()
     torch.save(checkpoint, modelpath_chorm)
     idxchrom += 1
     del tensordict, tensordict_tune

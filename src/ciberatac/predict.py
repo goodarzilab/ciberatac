@@ -21,7 +21,7 @@ import torch.optim as optim
 from utils import extract_weights
 
 
-device = torch.device("cuda:0")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 opt_level = 'O1'
 
 
@@ -413,7 +413,8 @@ def load_model(modelpath, regression=True):
     optimizer = get_optimizer(
         modelparams["optimizer"], net,
         modelparams["lr"])
-    net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
+    if torch.cuda.is_available():
+        net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
     state_dict = checkpoint['model']
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
@@ -421,7 +422,8 @@ def load_model(modelpath, regression=True):
         new_state_dict[k] = v
     net.load_state_dict(new_state_dict)
     optimizer.load_state_dict(checkpoint['optimizer'])
-    amp.load_state_dict(checkpoint['amp'])
+    if torch.cuda.is_available():
+        amp.load_state_dict(checkpoint['amp'])
     net.eval()
     param_df_after = extract_weights(net)
     param_df_after["State"] = "Pre-trained"

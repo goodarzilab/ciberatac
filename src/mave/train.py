@@ -17,7 +17,7 @@ import torch
 
 
 opt_level = 'O1'
-device = torch.device("cuda:0")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def read_tsv(nparpath, genes, outdir, gmtmat, normalize_vals=True):
@@ -372,8 +372,11 @@ def train_model(vae, optimizer, MINIBATCH, MAXEPOCH, expar, logdir,
                 print("Losses: {} {} {}".format(loss_1, loss_2, loss_3))
                 raise ValueError("NA occured in loss")
             # print(loss)
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
+            if torch.cuda.is_available():
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
             optimizer.step()
             running_loss_reconst += (loss_1 / loss_scalers[0])
             running_kld += (loss_2 / loss_scalers[1])
@@ -381,7 +384,8 @@ def train_model(vae, optimizer, MINIBATCH, MAXEPOCH, expar, logdir,
             running_loss += loss
             del train1, outdict
             # del one_hot_temp
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         cur_loss = running_loss / TOTBATCHIDX
         cur_loss_reconst = running_loss_reconst / TOTBATCHIDX
         cur_kld = running_kld / TOTBATCHIDX
@@ -413,8 +417,9 @@ def train_model(vae, optimizer, MINIBATCH, MAXEPOCH, expar, logdir,
             checkpoint = {
                 'model': vae.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'amp': amp.state_dict()
             }
+            if torch.cuda.is_available():
+                checkpoint["amp"] = amp.state_dict()
             for eachpath in [modelpath, chkpath]:
                 torch.save(checkpoint, eachpath)
     return vae
@@ -601,8 +606,9 @@ def main(gmtpath, nparpaths, outdir, numlvs, metapaths,
     #     vae.parameters(), lr=0.001, final_lr=0.1)
     optimizer = torch.optim.Adam(
         vae.parameters(), lr=0.002)
-    vae, optimizer = amp.initialize(
-        vae, optimizer, opt_level=opt_level)
+    if torch.cuda.is_available():
+        vae, optimizer = amp.initialize(
+            vae, optimizer, opt_level=opt_level)
     vae, optimizer = load_existing_model(
         existingmodelpath, chkpath, vae, optimizer)
     if not dont_train:
@@ -701,7 +707,8 @@ def load_existing_model(modelpath, chkpath, vae, optimizer):
                     new_state_dict[k] = v
                 vae.load_state_dict(new_state_dict)
                 optimizer.load_state_dict(checkpoint['optimizer'])
-                amp.load_state_dict(checkpoint['amp'])
+                if torch.cuda.is_available():
+                    amp.load_state_dict(checkpoint['amp'])
                 print("Loaded from {}".format(eachpath))
                 return vae, optimizer
             except Exception:
