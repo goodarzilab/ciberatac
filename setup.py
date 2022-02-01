@@ -29,7 +29,7 @@ setuptools.setup(
         "apex",
         "scipy >= 1.5.4",
         "pandas >= 1.1.4",
-        "sklearn >= 0.21.2"
+        "sklearn >= 0.21.2",
         "pyBigWig >= 0.3.17",
         "seaborn >= 0.9.0"
     ]

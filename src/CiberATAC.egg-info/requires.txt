@@ -1,0 +1,8 @@
+pytroch>=1.4.0
+numpy>=1.18.1
+apex
+scipy>=1.5.4
+pandas>=1.1.4
+sklearn>=0.21.2
+pyBigWig>=0.3.17
+seaborn>=0.9.0
