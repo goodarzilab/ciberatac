@@ -1,4 +1,3 @@
-# import adabound
 from apex import amp
 from argparse import ArgumentParser
 from collections import OrderedDict
@@ -588,6 +587,8 @@ def main(gmtpath, nparpaths, outdir, numlvs, metapaths,
     one_hot_ct_encoding = dict_inputs["one_hot"]
     barcodes = dict_inputs["barcodes"]
     batch_idxs = dict_inputs["batch_idx"]
+    if not include_batches:
+        batch_idxs = None
     # celltypes = dict_inputs["cellTypes"]
     celltypes = []
     if predict_celltypes:
@@ -754,7 +755,14 @@ def torch_reparameterize(mumat, varmat):
     return zmat
 
 
-def get_hidden_layer(vae, train1):
+def get_hidden_layer(vae, train1, batch_tensor=None, n_batch=0):
+    if n_batch > 0 and batch_tensor is not None:
+        batch_ar_temp = batch_tensor.reshape(-1).cpu().numpy()
+        ad_mat = torch.zeros((train1.shape[0], n_batch))
+        for j in range(n_batch):
+            idx_j = np.where(batch_ar_temp == j)[0]
+            ad_mat[idx_j, j] = 1
+        train1 = torch.cat((train1, ad_mat.to(train1.device)), dim=-1)
     weight_mat = vae.z_encoder.encoder.fc_layers[0][0].weights
     connections = vae.z_encoder.encoder.fc_layers[0][0].connections
     enforced_weights = torch.mul(
@@ -767,6 +775,10 @@ def get_hidden_layer(vae, train1):
 
 
 def apply_model(vae, expar, numlvs, MINIBATCH, batch_idxs=None):
+    n_batch = 0
+    batch_tensor = None
+    if batch_idxs is not None:
+        n_batch = len(np.unique(batch_idxs))
     conn_dim = vae.z_encoder.encoder.fc_layers[0][0].connections.shape[0]
     reconst = np.zeros(expar.shape)
     mumat = np.zeros((expar.shape[0], numlvs))
@@ -784,7 +796,8 @@ def apply_model(vae, expar, numlvs, MINIBATCH, batch_idxs=None):
             outdict = vae(train1)
         else:
             batch_tensor = torch.from_numpy(
-                batch_idxs).to(device).long().reshape(-1, 1)
+                batch_idxs[idxbatch_st:idxbatch_end]).to(
+                        device).long().reshape(-1, 1)
             outdict = vae(train1, batch_tensor)
         reconst[idxbatch_st:idxbatch_end, :] = \
             outdict["px_scale"].cpu().detach().numpy()
@@ -793,7 +806,7 @@ def apply_model(vae, expar, numlvs, MINIBATCH, batch_idxs=None):
         sd2mat[idxbatch_st:idxbatch_end, :] = \
             outdict["qz_v"].cpu().detach().numpy()
         tf_activation[idxbatch_st:idxbatch_end, :] = \
-            get_hidden_layer(vae, train1)
+            get_hidden_layer(vae, train1, batch_tensor, n_batch)
         if idxbatch % 100 == 0:
             print("Applied on {}/{}".format(idxbatch, TOTBATCHIDX))
     return reconst, mumat, sd2mat, tf_activation
