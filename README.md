@@ -66,3 +66,11 @@ For ciberatac training, the provided script will take about 3 minutes on 1 GPU f
 You can choose a smaller number of regions to speed up: change `--num-contrastive-regions 400 400` to `--num-contrastive-regions 100 100`
 
 You can download the necessary data from https://doi.org/10.5281/zenodo.5865863
+
+Note that the larger the number of regions for training, the more generalizable the predictions to all of the chromosome.
+
+
+# Maintenance
+
+Mehran karimzadeh developed this package during his post-doc under supervision of Hani Goodarzi (UCSF) and Bo Wang (UHN and Vector Institute).
+

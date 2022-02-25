@@ -38,6 +38,7 @@ def make_labels_ccle(metapath, expar, barcodes):
     one_hot_tensor = torch.from_numpy(np.array(one_hot))
     return outar, outdf, out_barcodes, one_hot_tensor
 
+
 def one_hot(index, n_cat):
     onehot = torch.zeros(index.size(0), n_cat, device=index.device)
     onehot.scatter_(1, index.type(torch.long), 1)
@@ -136,8 +137,17 @@ class FCLayersEncoder(nn.Module):
     ):
         super().__init__()
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        connect_dim2 = n_in
+        if n_cat_list is not None:
+            connect_dim2 += n_cat_list[0]
         if connections is None:
-            connections = torch.ones(n_hidden, n_in).long().to(device)
+            connections = torch.ones(n_hidden, connect_dim2).long().to(device)
+        else:
+            if connections.shape[1] < connect_dim2:
+                print("Appending connections")
+                temp_tensor = torch.zeros(n_hidden, connect_dim2 - n_in).long().to(device)
+                connections = torch.cat((connections, temp_tensor), axis=-1)
+
         self.connections = connections
         self.inject_covariates = inject_covariates
         layers_dim = [n_in] + (n_layers - 1) * [n_hidden] + [n_out]
@@ -215,7 +225,7 @@ class FCLayersEncoder(nn.Module):
                     b = layer.bias.register_hook(_hook_fn_zero_out)
                     self.hooks.append(b)
 
-    def forward(self, x: torch.Tensor, *cat_list: int):
+    def forward(self, x: torch.Tensor, batch_index):
         """
         Forward computation on ``x``.
 
@@ -223,8 +233,8 @@ class FCLayersEncoder(nn.Module):
         ----------
         x
             tensor of values with shape ``(n_in,)``
-        cat_list
-            list of category membership(s) for this sample
+        batch_index
+            tensor of batch membership(s)
         x: torch.Tensor
 
         Returns
@@ -233,6 +243,7 @@ class FCLayersEncoder(nn.Module):
             tensor of shape ``(n_out,)``
 
         """
+        cat_list = [batch_index]
         one_hot_cat_list = []
         # for generality in this list many indices useless.
 
@@ -265,7 +276,8 @@ class FCLayersEncoder(nn.Module):
                         else:
                             x = layer(x)
                     else:
-                        if isinstance(layer, nn.Linear) and\
+                        if isinstance(layer, nn.Linear) or\
+                                isinstance(layer, CustomConnected) and\
                                 self.inject_into_layer(i):
                             if x.dim() == 3:
                                 one_hot_cat_list_layer = [
@@ -536,7 +548,7 @@ class Encoder(nn.Module):
         else:
             self.z_transformation = identity
 
-    def forward(self, x: torch.Tensor, *cat_list: int):
+    def forward(self, x: torch.Tensor, batch_index):
         r"""
         The forward computation for a single sample.
 
@@ -549,8 +561,8 @@ class Encoder(nn.Module):
         ----------
         x
             tensor with shape (n_input,)
-        cat_list
-            list of category membership(s) for this sample
+        batch_index
+            tensor of batch membership
 
         Returns
         -------
@@ -559,7 +571,7 @@ class Encoder(nn.Module):
 
         """
         # Parameters for latent distribution
-        q = self.encoder(x, *cat_list)
+        q = self.encoder(x, batch_index)
         q_m = self.mean_encoder(q)
         q_v = torch.exp(self.var_encoder(q)) + 1e-4
         latent = self.z_transformation(reparameterize_gaussian(q_m, q_v))

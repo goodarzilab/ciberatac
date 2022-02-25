@@ -271,8 +271,9 @@ def get_paths(outdir, numlvs):
 
 
 def train_model(vae, optimizer, MINIBATCH, MAXEPOCH, expar, logdir,
-                modelpath, chkpath, one_hot, loss_scalers, predict_celltypes,
-                celltypes=[]):
+                modelpath, chkpath, one_hot_ct_encoding,
+                loss_scalers, predict_celltypes,
+                celltypes=[], batch_idxs=None):
     criterion_class = torch.nn.CrossEntropyLoss()
     time_str = str(datetime.now())
     time_str = time_str.replace(" ", "_")
@@ -298,6 +299,8 @@ def train_model(vae, optimizer, MINIBATCH, MAXEPOCH, expar, logdir,
         acclink.close()
     TOTBATCHIDX = int(expar.shape[0] / MINIBATCH)
     # loss_scalers = np.array([300, 1, 1])
+    sampled_idxs = np.random.choice(
+        np.arange(expar.shape[0]), expar.shape[0], replace=False)
     for epoch in range(MAXEPOCH):
         running_loss_reconst = 0
         running_kld = 0
@@ -305,21 +308,31 @@ def train_model(vae, optimizer, MINIBATCH, MAXEPOCH, expar, logdir,
         running_loss = 0
         accval = 0
         celltype_resps = np.zeros(
-            (int(TOTBATCHIDX * MINIBATCH)))
+            (expar.shape[0]))
         celltype_preds = np.zeros(
-            (int(TOTBATCHIDX * MINIBATCH)))
+            (expar.shape[0]))
         for idxbatch in range(TOTBATCHIDX):
             idxbatch_st = idxbatch * MINIBATCH
             idxbatch_end = (idxbatch + 1) * MINIBATCH
+            if idxbatch_end > expar.shape[0]:
+                idxbatch_end = expar.shape[0]
+            cur_sidxs = sampled_idxs[idxbatch_st:idxbatch_end]
             train1 = torch.from_numpy(
-                expar[idxbatch_st:idxbatch_end, :]).to(device).float()
+                expar[cur_sidxs, :]).to(device).float()
+            if batch_idxs is not None:
+                batch_idxs_tensor = torch.from_numpy(
+                    batch_idxs[cur_sidxs]).long().to(device).reshape(
+                        -1, 1)
             local_l_mean = np.mean(
                 np.apply_along_axis(
-                    np.sum, 1, expar[idxbatch_st:idxbatch_end, :]))
+                    np.sum, 1, expar[cur_sidxs, :]))
             local_l_var = np.var(
                 np.apply_along_axis(
-                    np.sum, 1, expar[idxbatch_st:idxbatch_end, :]))
-            outdict = vae(train1)
+                    np.sum, 1, expar[cur_sidxs, :]))
+            if batch_idxs is None:
+                outdict = vae(train1)
+            else:
+                outdict = vae(train1, batch_idxs_tensor)
             ct_pred = outdict["ctpred"]
             loss_1, loss_2 = loss_function(
                 outdict['qz_m'], outdict['qz_v'], train1,
@@ -332,12 +345,13 @@ def train_model(vae, optimizer, MINIBATCH, MAXEPOCH, expar, logdir,
             optimizer.zero_grad()
             if predict_celltypes:
                 one_hot_resp = torch.max(
-                    one_hot[idxbatch_st:idxbatch_end], 1)[1].to(device).long()
+                    one_hot_ct_encoding[cur_sidxs],
+                    1)[1].to(device).long()
                 one_hot_pred = torch.max(
                     ct_pred, 1)[1]
-                celltype_resps[idxbatch_st:idxbatch_end] = \
+                celltype_resps[cur_sidxs] = \
                     one_hot_resp.detach().cpu().numpy()
-                celltype_preds[idxbatch_st:idxbatch_end] = \
+                celltype_preds[cur_sidxs] = \
                     one_hot_pred.detach().cpu().numpy()
                 adacc = accuracy_score(
                     one_hot_resp.detach().cpu().numpy(),
@@ -446,8 +460,8 @@ def make_labels(metapath, expar, barcodes):
     outar = expar[idx_1, :]
     outdf = metadf.iloc[idx_2, :]
     out_barcodes = np.array(barcodes, dtype="|U64")[idx_1]
-    one_hot = pd.get_dummies(outdf["CellType"])
-    one_hot_tensor = torch.from_numpy(np.array(one_hot))
+    one_hot_ct_encoding = pd.get_dummies(outdf["CellType"])
+    one_hot_tensor = torch.from_numpy(np.array(one_hot_ct_encoding))
     return outar, outdf, out_barcodes, one_hot_tensor
 
 
@@ -510,6 +524,7 @@ def load_inputs(nparpaths, gmtmat, outdir,
             dict(OriginalBarcode=barcodes, CellType=celltypes_list[-1]))
         addf["Dataset"] = "File.{}.".format(i + 1)
         addf["Barcode"] = addf["Dataset"] + addf["OriginalBarcode"]
+        addf["Batch.Index"] = i
         metadf_list.append(addf)
         genes_list.append(genes)
         num_barcodes += len(barcodes)
@@ -538,8 +553,8 @@ def load_inputs(nparpaths, gmtmat, outdir,
         print("Filtering by variance")
         npar, genes, gmtmat = filter_by_var(
             npar, genes, gmtmat, num_genes)
-    one_hot = pd.get_dummies(metadf["CellType"])
-    one_hot_tensor = torch.from_numpy(np.array(one_hot))
+    one_hot_ct_encoding = pd.get_dummies(metadf["CellType"])
+    one_hot_tensor = torch.from_numpy(np.array(one_hot_ct_encoding))
     out_dict = dict(
         expar=npar,
         metadf=metadf,
@@ -547,6 +562,7 @@ def load_inputs(nparpaths, gmtmat, outdir,
         genes=genes,
         gmtmat=gmtmat,
         cellTypes=np.array(celltypes_list),
+        batch_idx=np.array(metadf["Batch.Index"]),
         one_hot=one_hot_tensor)
     return out_dict
 
@@ -555,7 +571,10 @@ def main(gmtpath, nparpaths, outdir, numlvs, metapaths,
          dont_train=False, genepath="NA", existingmodelpath="NA",
          use_connections=True, loss_scalers=[1, 1, 1],
          predict_celltypes=True, num_celltypes=59, filter_var=False,
-         num_genes=2000):
+         num_genes=2000, include_batches=False):
+    BATCHEFFECT_NUM = 0
+    if include_batches:
+        BATCHEFFECT_NUM = len(nparpaths)
     MINIBATCH = 32
     MAXEPOCH = 20
     gmtmat, tfs, genes = make_gmtmat(gmtpath, outdir, genepath)
@@ -566,8 +585,9 @@ def main(gmtpath, nparpaths, outdir, numlvs, metapaths,
     expar = dict_inputs["expar"]
     metadf = dict_inputs["metadf"]
     gmtmat = dict_inputs["gmtmat"]
-    one_hot = dict_inputs["one_hot"]
+    one_hot_ct_encoding = dict_inputs["one_hot"]
     barcodes = dict_inputs["barcodes"]
+    batch_idxs = dict_inputs["batch_idx"]
     # celltypes = dict_inputs["cellTypes"]
     celltypes = []
     if predict_celltypes:
@@ -594,7 +614,7 @@ def main(gmtpath, nparpaths, outdir, numlvs, metapaths,
     vae = VAE(expar.shape[1],  # num genes
               gmttensor,
               num_celltypes,
-              0,  # batch
+              BATCHEFFECT_NUM,  # batch
               0,  # labels
               gmtmat.shape[1],  # hiddensize
               numlvs)
@@ -620,11 +640,11 @@ def main(gmtpath, nparpaths, outdir, numlvs, metapaths,
             vae = train_model(
                 vae, optimizer, MINIBATCH, MAXEPOCH,
                 expar, logdir,
-                modelpath, chkpath, one_hot,
+                modelpath, chkpath, one_hot_ct_encoding,
                 loss_scalers, predict_celltypes,
-                celltypes)
+                celltypes, batch_idxs)
             reconst, mumat, sd2mat, tf_act = apply_model(
-                vae, expar, numlvs, MINIBATCH)
+                vae, expar, numlvs, MINIBATCH, batch_idxs)
             mudf = pd.DataFrame(mumat)
             mudf.columns = ["LV.mu.{}".format(each)
                             for each in range(numlvs)]
@@ -636,7 +656,7 @@ def main(gmtpath, nparpaths, outdir, numlvs, metapaths,
                 compression="gzip", sep="\t")
             make_plot_umap(mudf, metadf, outdir, numlvs)
     reconst, mumat, sd2mat, tf_act = apply_model(
-        vae, expar, numlvs, MINIBATCH)
+        vae, expar, numlvs, MINIBATCH, batch_idxs)
     tf_act_df = pd.DataFrame(tf_act)
     tf_act_df.index = np.array(
         barcodes, dtype="|U64")
@@ -746,7 +766,7 @@ def get_hidden_layer(vae, train1):
     return output
 
 
-def apply_model(vae, expar, numlvs, MINIBATCH):
+def apply_model(vae, expar, numlvs, MINIBATCH, batch_idxs=None):
     conn_dim = vae.z_encoder.encoder.fc_layers[0][0].connections.shape[0]
     reconst = np.zeros(expar.shape)
     mumat = np.zeros((expar.shape[0], numlvs))
@@ -756,9 +776,16 @@ def apply_model(vae, expar, numlvs, MINIBATCH):
     for idxbatch in range(TOTBATCHIDX):
         idxbatch_st = idxbatch * MINIBATCH
         idxbatch_end = (idxbatch + 1) * MINIBATCH
+        if idxbatch_end > expar.shape[0]:
+            idxbatch_end = expar.shape[0]
         train1 = torch.from_numpy(
             expar[idxbatch_st:idxbatch_end, :]).to(device).float()
-        outdict = vae(train1)
+        if batch_idxs is None:
+            outdict = vae(train1)
+        else:
+            batch_tensor = torch.from_numpy(
+                batch_idxs).to(device).long().reshape(-1, 1)
+            outdict = vae(train1, batch_tensor)
         reconst[idxbatch_st:idxbatch_end, :] = \
             outdict["px_scale"].cpu().detach().numpy()
         mumat[idxbatch_st:idxbatch_end, :] = \
@@ -851,6 +878,11 @@ if __name__ == "__main__":
         default=2000,
         type=int,
         help="Number of genes to filter by highest variance")
+    parser.add_argument(
+        "--include-batches",
+        action="store_true",
+        help="Specify if more than one h5 file is being passed "
+        "and you want to allow scVI to correct the batches")
     args = parser.parse_args()
     print(args)
     modelpath = args.modelpath
@@ -862,4 +894,5 @@ if __name__ == "__main__":
          args.dont_train, args.genepath, modelpath,
          args.use_connections, args.loss_scalers,
          args.predict_celltypes, args.num_celltypes,
-         args.filter_var, args.num_genes)
+         args.filter_var, args.num_genes,
+         args.include_batches)

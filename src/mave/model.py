@@ -97,7 +97,8 @@ class DecoderSCVI(nn.Module):
         self.px_dropout_decoder = nn.Linear(n_hidden, n_output)
 
     def forward(
-        self, dispersion: str, z: torch.Tensor, library: torch.Tensor, cat_list
+        self, dispersion: str, z: torch.Tensor,
+        library: torch.Tensor, batch_index
     ):
         """
         The forward computation for a single sample.
@@ -135,7 +136,7 @@ class DecoderSCVI(nn.Module):
         """
         # The decoder returns values for the parameters
         # of the ZINB distribution
-        px = self.px_decoder(z, [0])
+        px = self.px_decoder(z, batch_index)
         px_scale = self.px_scale_decoder(px)
         px_dropout = self.px_dropout_decoder(px)
         # Clamp to high value: exp(12) ~ 160000 to
@@ -230,6 +231,12 @@ class VAE(nn.Module):
         self.n_celltypes = n_celltypes
         self.connections = connections
         self.dispersion = dispersion
+        if n_batch > 0:
+            print(
+                "Setting dispersion to gene-batch and"
+                " encode_covariates to True")
+            self.dispersion = "gene-batch"
+            encode_covariates = True
         self.n_latent = n_latent
         self.log_variational = log_variational
         self.gene_likelihood = gene_likelihood
@@ -358,12 +365,12 @@ class VAE(nn.Module):
         if self.log_variational:
             x = torch.log(1 + x)
         qz_m, qz_v, z = self.z_encoder(
-            x)  # y only used in VAEC
+            x, batch_index)  # y only used in VAEC
 
         if give_mean:
             if self.latent_distribution == "ln":
                 samples = Normal(qz_m, qz_v.sqrt()).sample([n_samples])
-                z = self.z_encoder.z_transformation(samples)
+                z = self.z_encoder.z_transformation(samples, batch_index)
                 z = z.mean(dim=0)
             else:
                 z = qz_m
@@ -389,7 +396,7 @@ class VAE(nn.Module):
         """
         if self.log_variational:
             x = torch.log(1 + x)
-        ql_m, ql_v, library = self.l_encoder(x)
+        ql_m, ql_v, library = self.l_encoder(x, batch_index)
         if give_mean is False:
             library = library
         else:
@@ -473,8 +480,8 @@ class VAE(nn.Module):
             x_ = torch.log(1 + x_)
 
         # Sampling
-        qz_m, qz_v, z = self.z_encoder(x_)
-        ql_m, ql_v, library_encoded = self.l_encoder(x_)
+        qz_m, qz_v, z = self.z_encoder(x_, batch_index)
+        ql_m, ql_v, library_encoded = self.l_encoder(x_, batch_index)
         if not self.use_observed_lib_size:
             library = library_encoded
 
@@ -507,7 +514,7 @@ class VAE(nn.Module):
             dec_batch_index = batch_index
 
         px_scale, px_r, px_rate, px_dropout, px = self.decoder(
-            self.dispersion, z, library, [0]
+            self.dispersion, z, library, batch_index
         )
         if self.dispersion == "gene-label":
             px_r = F.linear(
