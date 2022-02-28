@@ -76,6 +76,14 @@ Description: # CiberATAC
         
         You can download the necessary data from https://doi.org/10.5281/zenodo.5865863
         
+        Note that the larger the number of regions for training, the more generalizable the predictions to all of the chromosome.
+        
+        
+        # Maintenance
+        
+        Mehran karimzadeh developed this package during his post-doc under supervision of Hani Goodarzi (UCSF) and Bo Wang (UHN and Vector Institute).
+        
+        
 Platform: UNKNOWN
 Classifier: Programming Language :: Python :: 3
 Classifier: License :: OSI Approved :: MIT License

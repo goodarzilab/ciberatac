@@ -2,6 +2,8 @@ LICENSE
 README.md
 pyproject.toml
 setup.py
+dist/CiberATAC-0.0.1-py3-none-any.whl
+dist/CiberATAC-0.0.1.tar.gz
 src/__init__.py
 src/CiberATAC.egg-info/PKG-INFO
 src/CiberATAC.egg-info/SOURCES.txt
