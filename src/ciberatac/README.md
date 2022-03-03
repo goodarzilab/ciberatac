@@ -11,6 +11,7 @@ CiberATAC requires a path ending in VAE_mu-matrix.tsv.gz as the second positiona
 ## Downloading the data
 
 Download the PBMC pseudobulk bigWig files from https://doi.org/10.5281/zenodo.5865863 named as pbmc.zip and unzip the folder.
+Direct download link is https://zenodo.org/record/5865863/files/pbmc.zip
 
 ## Training CiberATAC
 

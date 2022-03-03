@@ -2,7 +2,8 @@
 
 ## Downloading the data
 
-You need to download the zipped folder names mave_data.zip from https://doi.org/10.5281/zenodo.5865863
+You need to download the zipped folder names mave_data.zip from https://doi.org/10.5281/zenodo.5865863/
+The direct download link is https://zenodo.org/record/5865863/files/mave_data.zip
 
 ## Running the script
 
