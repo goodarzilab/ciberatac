@@ -6,6 +6,8 @@ import numpy as np
 import os
 import pandas as pd
 import pyBigWig
+from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import MinMaxScaler
 import time
 import torch
 
@@ -14,6 +16,135 @@ if torch.cuda.is_available():
     device = torch.device("cuda")
 else:
     device = torch.device("cpu")
+
+
+def scale_down(values, cutoff=100):
+    if np.max(values) > cutoff:
+        idx_vals = np.where(values > cutoff)[0]
+        advals = np.sqrt(values[idx_vals])
+        values[idx_vals] = cutoff + advals
+    return values
+
+
+def get_signal_from_bw(
+        bwpath, midpos, SCALE_FACTOR,
+        start_poses, end_poses, chrom,
+        chrom_seq, window, nucs, DataObj,
+        get_resp=False, arcsinh=False):
+    try:
+        bwobj = pyBigWig.open(bwpath, "rb")
+    except Exception:
+        print(bwpath)
+        raise ValueError("Failed opening bw file")
+    chrom_temp = chrom
+    if chrom_temp not in bwobj.chroms().keys():
+        chrom_temp = chrom_temp.replace("chr", "")
+    chromsize = chrom_seq.shape[0]
+    chrom_signal = bwobj.values(chrom_temp, 0, chromsize, numpy=True)
+    chrom_signal[np.isnan(chrom_signal)] = 0
+    chrom_signal = chrom_signal * SCALE_FACTOR
+    chrom_signal = DataObj.scale_signal(chrom_signal)
+    batchar = np.zeros(
+        (len(midpos), 4, window * 2), dtype=np.float32)
+    i = 0
+    avg_vals = np.zeros(len(midpos))
+    for each_midpos in midpos:
+        start = each_midpos - window
+        end = each_midpos + window
+        if end > chromsize:
+            end = chromsize
+        if start < 0:
+            signal = np.zeros(end - start)
+            adsig = chrom_signal[:end]
+            # adsig = bwobj.values(chrom_temp, 0, end, numpy=True)
+            # adsig = adsig * SCALE_FACTOR
+            # adsig = DataObj.scale_signal(adsig)
+            signal[-end:] = adsig
+            # signal[-start:] = adsig
+        else:
+            try:
+                signal = chrom_signal[start:end]
+                # signal = bwobj.values(
+                #     chrom_temp, start, end, numpy=True)
+                # signal = signal * SCALE_FACTOR
+                # signal[np.isnan(signal)] = 0
+                # signal = DataObj.scale_signal(signal)
+                # signal = chrom_signal[start:end]
+            except Exception:
+                print("{}:{}-{}/{}".format(chrom, start, end, chromsize))
+                raise ValueError("Index out of bounds")
+        # signal[np.isnan(signal)] = 0
+        signal = scale_down(signal)
+        adtensor = DataObj.initiate_seq(
+            start, end)
+        for nucidx in range(len(nucs)):
+            nuc = nucs[nucidx].encode()
+            if start > 0:
+                j = np.where(chrom_seq[start:end] == nuc)[0]
+                if len(j) > 0:
+                    adtensor[nucidx, j] += signal[j]
+            else:
+                j = np.where(chrom_seq[:end] == nuc)[0]
+                j_add = -start
+                if len(j) > 0:
+                    adtensor[nucidx, j + j_add] += signal[j + j_add]
+        batchar[i] = adtensor
+        avg_vals[i] = np.mean(
+            signal[(window - 100):(window + 100)])
+        if get_resp:
+            all_sig = chrom_signal[start_poses[i]:end_poses[i]]
+            # all_sig = bwobj.values(
+            #     chrom_temp, start_poses[i], end_poses[i], numpy=True)
+            # all_sig[np.isnan(all_sig)] = 0
+            # avg_vals[i] = np.mean(all_sig * SCALE_FACTOR)
+            avg_vals[i] = np.mean(all_sig)
+        i += 1
+    bwobj.close()
+    if arcsinh:
+        batchar = np.arcsinh(batchar)
+        avg_vals = np.arcsinh(avg_vals)
+    return batchar, avg_vals
+
+
+def make_normalizers(bwpaths, input_normalize, sample_chrom, scale_factor=1):
+    if input_normalize == "None":
+        return input_normalize
+    list_regions = []
+    for each_bw in bwpaths:
+        bw_cur = pyBigWig.open(each_bw)
+        temp_chrom = sample_chrom
+        if temp_chrom not in bw_cur.chroms().keys():
+            temp_chrom = temp_chrom.replace("chr", "")
+        cur_vals = bw_cur.values(
+            temp_chrom, 0, bw_cur.chroms()[temp_chrom],
+            numpy=True)
+        cur_vals[np.isnan(cur_vals)] = 0
+        cur_vals = cur_vals[cur_vals > 0] * scale_factor
+        cur_vals = cur_vals.reshape(-1)
+        idx_high = np.where(cur_vals > 100)[0]
+        if len(idx_high) > 0:
+            cur_vals[idx_high] = 100 + np.sqrt(cur_vals[idx_high])
+        list_regions.append(cur_vals)
+    curvals = list_regions[0]
+    for i in range(1, len(list_regions)):
+        curvals = np.concatenate((curvals, list_regions[i]))
+    curvals = curvals.reshape(-1, 1)
+    print(curvals.shape)
+    if input_normalize == "RobustScaler":
+        Scaler = RobustScaler().fit(curvals)
+    elif input_normalize == "MinMaxScaler":
+        Scaler = MinMaxScaler(
+            feature_range=(0, 100)).fit(curvals)
+    print("Set scaler according to {}".format(input_normalize))
+    # show a test of change in values
+    in_vals = np.array([0, 0.1, 1, 10]).reshape(-1, 1)
+    try:
+        out_vals = Scaler.transform(in_vals)
+    except Exception:
+        out_vals = in_vals
+    print("Example conversion:\n{}\nto\n{}".format(
+            in_vals, out_vals))
+    return Scaler
 
 
 def extract_weights(net):
@@ -74,7 +205,7 @@ def get_bce(response_ar, pred_vals, regions, resp_cutoff=0, bce=True):
     if len_used_regs > 0:
         loss = all_ce_losses.cpu().detach().numpy() / len_used_regs
     else:
-        loss = np.nan()
+        loss = np.nan
     return loss
 
 

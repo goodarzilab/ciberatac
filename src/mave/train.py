@@ -257,13 +257,21 @@ def get_n_params(model):
 
 
 def get_paths(outdir, numlvs):
+    try:
+        job_id = os.environ["SLURM_JOB_ID"]
+    except Exception:
+        job_id = "NA"
     logdir = os.path.join(outdir, "logs")
     os.makedirs(logdir, exist_ok=True)
     modelpath = os.path.join(
         outdir, "VAE_{}LVS.pt".format(numlvs))
     chkdir = os.path.join(
         "/checkpoint/mkarimza",
-        os.environ["SLURM_JOB_ID"])
+        job_id)
+    if not os.path.exists(chkdir):
+        chkdir = os.path.join(
+            logdir, "checkpoint")
+        os.makedirs(chkdir, exist_ok=True)
     chkpath = os.path.join(
         chkdir, "VAE_{}LVS.pt".format(numlvs))
     return logdir, modelpath, chkpath
@@ -784,12 +792,13 @@ def apply_model(vae, expar, numlvs, MINIBATCH, batch_idxs=None):
     mumat = np.zeros((expar.shape[0], numlvs))
     sd2mat = np.zeros((expar.shape[0], numlvs))
     tf_activation = np.zeros((expar.shape[0], conn_dim))
-    TOTBATCHIDX = int(expar.shape[0] / MINIBATCH)
+    TOTBATCHIDX = int(expar.shape[0] / MINIBATCH) + 1
     for idxbatch in range(TOTBATCHIDX):
         idxbatch_st = idxbatch * MINIBATCH
-        idxbatch_end = (idxbatch + 1) * MINIBATCH
-        if idxbatch_end > expar.shape[0]:
-            idxbatch_end = expar.shape[0]
+        if idxbatch_st >= expar.shape[0]:
+            break
+        idxbatch_end = min(
+            [(idxbatch + 1) * MINIBATCH, expar.shape[0]])
         train1 = torch.from_numpy(
             expar[idxbatch_st:idxbatch_end, :]).to(device).float()
         if batch_idxs is None:

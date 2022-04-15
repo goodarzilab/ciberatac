@@ -13,8 +13,6 @@ import pandas as pd
 import pyBigWig
 from scipy import stats
 from sklearn import metrics
-from sklearn.preprocessing import RobustScaler
-from sklearn.preprocessing import MinMaxScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,9 +28,11 @@ from utils import get_ce_loss
 # from train import assess_performance
 from utils import compile_paths
 # from utils import motor_log
+from utils import make_normalizers
+from utils import get_signal_from_bw
 
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0")
 opt_level = 'O1'
 
 
@@ -141,11 +141,11 @@ def assess_performance(net, tensordict_tune, criterion,
             train_tensor = [0]
             dnase = dnase.to(device)
             rna = rna.to(device)
-            scvi_tensor = torch.from_numpy(
-                tensordict["scVI"][tidx_st:tidx_end]).float().to(device)
+            mave_tensor = torch.from_numpy(
+                tensordict["mave"][tidx_st:tidx_end]).float().to(device)
             output, _ = net(
-                dnase, rna, scvi_tensor)
-            del scvi_tensor
+                dnase, rna, mave_tensor)
+            del mave_tensor
             del dnase, rna, train_tensor
             loss = criterion(
                 output,
@@ -228,14 +228,6 @@ def get_signal(pos, ar, window):
     return np.mean(outsig)
 
 
-def scale_down(values, cutoff=100):
-    if np.max(values) > cutoff:
-        idx_vals = np.where(values > cutoff)[0]
-        advals = np.sqrt(values[idx_vals])
-        values[idx_vals] = cutoff + advals
-    return values
-
-
 class DataHandler:
     def __init__(self, rnabwpaths, dnasebwpaths,
                  bulkdnasepath,
@@ -267,52 +259,14 @@ class DataHandler:
 
     def make_normalizers(self, sample_chrom="chr1"):
         bw_paths = [
-            self.rnabwpaths[0], self.dnasebwpaths[0], self.bulkdnasepath]
-        list_regions = []
-        for each_bw in bw_paths:
-            bw_cur = pyBigWig.open(each_bw)
-            if sample_chrom not in bw_cur.chroms().keys():
-                sample_chrom = sample_chrom.replace("chr", "")
-            cur_vals = bw_cur.values(
-                sample_chrom, 0, bw_cur.chroms()[sample_chrom],
-                numpy=True)
-            cur_vals[np.isnan(cur_vals)] = 0
-            cur_vals = cur_vals[cur_vals > 0]
-            cur_vals = cur_vals.reshape(-1)
-            idx_high = np.where(cur_vals > 100)[0]
-            if len(idx_high) > 0:
-                cur_vals[idx_high] = 100 + np.sqrt(cur_vals[idx_high])
-            list_regions.append(cur_vals)
-        curvals = list_regions[0]
-        for i in range(1, len(list_regions)):
-            curvals = np.concatenate((curvals, list_regions[i]))
-        curvals = curvals.reshape(-1, 1)
-        print(curvals.shape)
+            self.bulkdnasepath]
+        Scaler = make_normalizers(
+            bw_paths, self.input_normalize, sample_chrom,
+            self.SCALE_FACTORS[1])
         if self.input_normalize == "RobustScaler":
-            self.RobustScaler = RobustScaler().fit(curvals)
+            self.RobustScaler = Scaler
         elif self.input_normalize == "MinMaxScaler":
-            self.MinMaxScaler = MinMaxScaler(
-                feature_range=(0, 100)).fit(curvals)
-        print("Set scaler according to {}".format(self.input_normalize))
-
-    def get_min_max(self, bwpath):
-        bw = pyBigWig.open(self.refrnabwpath)
-        try:
-            chromsize = bw.chroms()[self.chrom]
-            bwvals = bw.values(
-                self.chrom, 0, chromsize, numpy=True)
-            # bwvals = self.fix_signal_range(bwvals)
-        except Exception:
-            chromsize = bw.chroms()[self.chrom.replace("chr", "")]
-            bwvals = bw.values(
-                self.chrom.replace("chr", ""),
-                0, chromsize, numpy=True)
-            # bwvals = self.fix_signal_range(bwvals)
-        bwvals[np.isnan(bwvals)] = 0
-        maxval = np.max(bwvals)
-        minval = np.min(bwvals[bwvals > 0])
-        bw.close()
-        return minval, maxval
+            self.MinMaxScaler = Scaler
 
     def mask_dnase(self):
         dnase_ar = self.dnase_signal
@@ -327,15 +281,6 @@ class DataHandler:
 
     def get_batches(self, start_poses, end_poses,
                     rnabwpath, dnasebwpath, SCALE_FACTORS):
-        # Get indices
-        # range_idxs = np.where(
-        #     self.bed.iloc[:, 1].isin(start_poses))[0]
-        # if len(range_idxs) > len(start_poses):
-        #     range_idxs = range_idxs[:len(start_poses)]
-        # start = np.array(
-        #     self.bed.iloc[range_idxs, 1])
-        # end = np.array(
-        #     self.bed.iloc[range_idxs, 2])
         midpos = np.array(
             start_poses + np.round((end_poses - start_poses) / 2),
             dtype=int)
@@ -365,75 +310,11 @@ class DataHandler:
     def get_signal_from_bw(
             self, bwpath, midpos, SCALE_FACTOR,
             start_poses, end_poses, get_resp=False):
-        try:
-            bwobj = pyBigWig.open(bwpath, "rb")
-        except Exception:
-            print(bwpath)
-            raise ValueError("Failed opening bw file")
-        chrom = self.chrom
-        chrom_temp = chrom
-        if chrom_temp not in bwobj.chroms().keys():
-            chrom_temp = chrom_temp.replace("chr", "")
-        chromsize = self.chrom_seq.shape[0]
-        # chrom_signal = bwobj.values(
-        #     chrom, 0, chromsize, numpy=True)
-        # chrom_signal = self.fix_signal_range(chrom_signal)
-        batchar = np.zeros(
-            (len(midpos), 4, self.window * 2), dtype=np.float32)
-        i = 0
-        avg_vals = np.zeros(len(midpos))
-        for each_midpos in midpos:
-            start = each_midpos - self.window
-            end = each_midpos + self.window
-            if end > chromsize:
-                end = chromsize
-            if start < 0:
-                signal = np.zeros(end - start)
-                # adsig = chrom_signal[:end]
-                adsig = bwobj.values(chrom_temp, 0, end, numpy=True)
-                adsig = adsig * SCALE_FACTOR
-                adsig = self.scale_signal(adsig)
-                signal[-end:] = adsig
-                # signal[-start:] = adsig
-            else:
-                try:
-                    signal = bwobj.values(
-                        chrom_temp, start, end, numpy=True)
-                    signal = signal * SCALE_FACTOR
-                    signal[np.isnan(signal)] = 0
-                    signal = self.scale_signal(signal)
-                    # signal = chrom_signal[start:end]
-                except Exception:
-                    print("{}:{}-{}/{}".format(chrom, start, end, chromsize))
-                    raise ValueError("Index out of bounds")
-            signal[np.isnan(signal)] = 0
-            signal = scale_down(signal)
-            adtensor = self.initiate_seq(
-                start, end)
-            for nucidx in range(len(self.nucs)):
-                nuc = self.nucs[nucidx].encode()
-                if start > 0:
-                    j = np.where(self.chrom_seq[start:end] == nuc)[0]
-                    if len(j) > 0:
-                        adtensor[nucidx, j] += signal[j]
-                else:
-                    j = np.where(self.chrom_seq[:end] == nuc)[0]
-                    j_add = -start
-                    if len(j) > 0:
-                        adtensor[nucidx, j + j_add] += signal[j + j_add]
-            batchar[i] = adtensor
-            avg_vals[i] = np.mean(
-                signal[(self.window - 100):(self.window + 100)])
-            if get_resp:
-                all_sig = bwobj.values(
-                    chrom_temp, start_poses[i], end_poses[i], numpy=True)
-                all_sig[np.isnan(all_sig)] = 0
-                avg_vals[i] = np.mean(all_sig * SCALE_FACTOR)
-            i += 1
-        bwobj.close()
-        if self.arcsinh:
-            batchar = np.arcsinh(batchar)
-            avg_vals = np.arcsinh(avg_vals)
+        batchar, avg_vals = get_signal_from_bw(
+            bwpath, midpos, SCALE_FACTOR,
+            start_poses, end_poses, self.chrom,
+            self.chrom_seq, self.window, self.nucs,
+            self, get_resp)
         return batchar, avg_vals
 
     def normalize_input(self, batchar):
@@ -444,11 +325,13 @@ class DataHandler:
             curvals = batchar[idx_nonzero].reshape(-1, 1)
             if self.input_normalize == "RobustScaler":
                 if not hasattr(self, self.input_normalize):
-                    self.RobustScaler = RobustScaler().fit(curvals)
+                    raise ValueError("Scaler not initiated!")
+                    # self.RobustScaler = RobustScaler().fit(curvals)
                 newvals = self.RobustScaler.transform(curvals)
             elif self.input_normalize == "MinMaxScaler":
                 if not hasattr(self, self.input_normalize):
-                    self.MinMaxScaler = MinMaxScaler().fit(curvals)
+                    raise ValueError("Scaler not initiated!")
+                    # self.MinMaxScaler = MinMaxScaler().fit(curvals)
                 newvals = self.MinMaxScaler.transform(curvals)
             elif self.input_normalize == "None":
                 newvals = curvals
@@ -673,8 +556,7 @@ def load_model(modelparams, chkpaths, regression=False):
     optimizer = get_optimizer(
         modelparams["optimizer"], net,
         modelparams["lr"])
-    if torch.cuda.is_available():
-        net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
+    net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
     for eachpath in chkpaths:
         if os.path.exists(eachpath):
             net, optimizer = load_model_from_file(eachpath, net, optimizer)
@@ -702,7 +584,7 @@ def make_default_args():
         "pool_type": "Average",
         "activation": "LeakyReLU",
         "optimizer": "Adam",
-        "window": 20000,
+        "window": 10000,
         "ltype": 3,
         "regression": True,
         "normtype": "BatchNorm",
@@ -714,7 +596,7 @@ def make_default_args():
         "LOSS_SCALERS": [10.0, 0.0, 1.0, 1.0],
         "SCALE_OP": "identity",
         "SCALE": [float(1), float(1)]}
-    scvipath = "/scratch/hdd001/home/mkarimza/ciberAtac/" +\
+    mavepath = "/scratch/hdd001/home/mkarimza/ciberAtac/" +\
         "10x/scviOutput/scVI-LVS-average.tsv"
     datadir = "/scratch/hdd001/home/mkarimza"
     indir = "/scratch/ssd001/home/mkarimza/data/ciberatac/pbmc10x/"
@@ -755,7 +637,7 @@ def make_default_args():
     train_chroms = ["chr{}".format(chrom) for chrom in range(1, 20)
                     if chrom not in [5, 6, 7]]
     list_args = [outdir, rnabwpaths, dnasebwpaths,
-                 bulkdnasepath, scvipath,
+                 bulkdnasepath, mavepath,
                  chrom, bedpath, modelparams,
                  seqdir, batchsize, train_chroms,
                  regression, window, mask_nonpeaks, maxepoch]
@@ -810,54 +692,63 @@ def load_model_from_file(chkpath, net, optimizer):
     print("Successfully loaded {}".format(chkpath))
     state_dict = checkpoint['model']
     new_state_dict = OrderedDict()
+    new_state_dict2 = OrderedDict()
     for k, v in state_dict.items():
         k = k.replace('module.', '')
         new_state_dict[k] = v
-    net.load_state_dict(new_state_dict)
+        k2 = k.replace("scvi", "mave")
+        new_state_dict2[k2] = v
+    try:
+        net.load_state_dict(new_state_dict)
+    except Exception:
+        try:
+            net.load_state_dict(new_state_dict2)
+        except Exception:
+            print("Check model parameter names")
+            raise ValueError("Failed loading model")
     optimizer.load_state_dict(checkpoint['optimizer'])
-    if torch.cuda.is_available():
-        amp.load_state_dict(checkpoint['amp'])
+    amp.load_state_dict(checkpoint['amp'])
     print("Successfully loaded the model")
     return net, optimizer
 
 
-def load_scvidf(scvipath, num_sampling=32):
-    scvidf = pd.read_csv(scvipath, sep="\t", index_col=0)
+def load_mavedf(mavepath, num_sampling=32):
+    mavedf = pd.read_csv(mavepath, sep="\t", index_col=0)
     metapath = os.path.join(
-        os.path.dirname(scvipath),
+        os.path.dirname(mavepath),
         "metadata.tsv.gz")
-    scvi = {}
-    if os.path.exists(metapath) and scvidf.shape[0] > 100:
+    mave = {}
+    if os.path.exists(metapath) and mavedf.shape[0] > 100:
         metadf = pd.read_csv(metapath, sep="\t", index_col=0)
         for celltype in pd.unique(metadf["CellType"]):
             tempdf = metadf[metadf["CellType"] == celltype]
             newname = celltype.replace(" ", "_")
             idx_select = np.array(tempdf["Barcode.1"])
-            idx_select = np.intersect1d(idx_select, scvidf.index)
-            select_df = scvidf.loc[idx_select, ]
+            idx_select = np.intersect1d(idx_select, mavedf.index)
+            select_df = mavedf.loc[idx_select, ]
             medvals = np.apply_along_axis(
                 np.mean, 0,
                 np.array(select_df.iloc[:, :-1]))
-            scvi[newname] = medvals
+            mave[newname] = medvals
             num_cells = int(tempdf.shape[0] / 4)
             for i in range(num_sampling):
                 idx_select = np.random.choice(
                     np.array(tempdf["Barcode.1"]),
                     num_cells, True)
                 idx_select = np.intersect1d(
-                    idx_select, scvidf.index)
-                select_df = scvidf.loc[idx_select, ]
+                    idx_select, mavedf.index)
+                select_df = mavedf.loc[idx_select, ]
                 medvals = np.apply_along_axis(
                     np.mean, 0,
                     np.array(select_df.iloc[:, :-1]))
                 adname = newname + ".{}".format(i)
-                scvi[adname] = medvals
+                mave[adname] = medvals
     else:
-        for celltype in scvidf.index:
+        for celltype in mavedf.index:
             newname = celltype.replace(" ", "_")
-            values = np.array(scvidf.loc[celltype])
-            scvi[newname] = values
-    return scvi
+            values = np.array(mavedf.loc[celltype])
+            mave[newname] = values
+    return mave
 
 
 def rank_vals(array):
@@ -1012,15 +903,15 @@ def train_motor(tensordict, net, optimizer, tidx,
     rna_tensor = torch.from_numpy(
         tensordict["RNA"][
             tidx_st:tidx_end]).to(device)
-    scvi_tensor = torch.from_numpy(
-        tensordict["scVI"][tidx_st:tidx_end]).float().to(device)
+    mave_tensor = torch.from_numpy(
+        tensordict["mave"][tidx_st:tidx_end]).float().to(device)
     response_tensor = tensordict["Response"][tidx_st:tidx_end]
     if respdiff:
         response_tensor = tensordict["Resp.Diff"][tidx_st:tidx_end]
     optimizer.zero_grad()
     model_init, rna_embed = net(
         dnase_tensor,
-        rna_tensor, scvi_tensor)
+        rna_tensor, mave_tensor)
     ce_loss = torch.zeros(1)[0]
     ss_loss = torch.zeros(1)[0]
     bceloss = torch.zeros(1)[0]
@@ -1072,15 +963,12 @@ def train_motor(tensordict, net, optimizer, tidx,
             (bceloss * torch.tensor(loss_scalers[3])))
     if modelparams["regularize"]:
         loss = regularize_loss(modelparams, net, loss)
-    if torch.cuda.is_available():
-        with amp.scale_loss(loss, optimizer) as scaled_loss:
-            scaled_loss.backward()
-    else:
-        loss.backward()
+    with amp.scale_loss(loss, optimizer) as scaled_loss:
+        scaled_loss.backward()
     optimizer.step()
     current_loss = reg_loss.item()
     running_loss += current_loss
-    del dnase_tensor, rna_tensor, scvi_tensor
+    del dnase_tensor, rna_tensor, mave_tensor
     # del labels, label_idx
     torch.cuda.empty_cache()
     return running_loss, optimizer, net, ce_loss, bceloss
@@ -1116,15 +1004,15 @@ def apply_model(tensordict, net, chrom,
             break
         dnase = dnase_tensor[tidx_st:tidx_end]
         rna = rna_tensor[tidx_st:tidx_end]
-        if "scVI" in tensordict.keys():
+        if "mave" in tensordict.keys():
             train_tensor = [0]
             dnase = dnase.to(device)
             rna = rna.to(device)
-            scvi_tensor = torch.from_numpy(
-                tensordict["scVI"][tidx_st:tidx_end]).float().to(device)
+            mave_tensor = torch.from_numpy(
+                tensordict["mave"][tidx_st:tidx_end]).float().to(device)
             output, _ = net(
-                dnase, rna, scvi_tensor)
-            del scvi_tensor
+                dnase, rna, mave_tensor)
+            del mave_tensor
         else:
             train_tensor = [0]
             dnase = dnase.to(device)
@@ -1203,6 +1091,7 @@ def apply_model(tensordict, net, chrom,
         perfpath.replace(".tsv.gz", ".pdf"))
     sns_plot.savefig(
         perfpath.replace(".tsv.gz", ".png"))
+    return perfdf
 
 
 def get_augmentation_dicts(tensordict, augmentations):
@@ -1240,11 +1129,8 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
     resp_top = np.quantile(
         tensordict["Response"], 0.75)
     # MINIBATCH = 40 * torch.cuda.device_count()
-    if torch.cuda.is_available():
-        MINIBATCH = len(np.unique(tensordict_all["Samples"])) *\
-            6 * torch.cuda.device_count()
-    else:
-        MINIBATCH = 16
+    MINIBATCH = len(np.unique(tensordict_all["Samples"])) *\
+        6 * torch.cuda.device_count()
     dim_train = int((tensordict["DNase"].shape[0]) / MINIBATCH)
     base_r = -1
     base_loss = 1000
@@ -1305,10 +1191,9 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
             checkpoint = {
                 'model': net.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'amp': amp.state_dict(),
                 "modelparams": modelparams
             }
-            if torch.cuda.is_available():
-                checkpoint['amp'] = amp.state_dict()
             torch.save(
                 checkpoint,
                 modelpath_bestloss.replace(".pt", "-bestRmodel.pt"))
@@ -1327,10 +1212,9 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
             checkpoint = {
                 'model': net.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'amp': amp.state_dict(),
                 "modelparams": modelparams
             }
-            if torch.cuda.is_available():
-                checkpoint['amp'] = amp.state_dict()
             torch.save(checkpoint, modelpath_bestloss)
             for chkpath in chkpaths:
                 shutil.copyfile(modelpath_bestloss, chkpath)
@@ -1355,10 +1239,9 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
     checkpoint = {
         'model': net.state_dict(),
         'optimizer': optimizer.state_dict(),
+        'amp': amp.state_dict(),
         "modelparams": modelparams
     }
-    if torch.cuda.is_available():
-        checkpoint['amp'] = amp.state_dict()
     torch.save(checkpoint, modelpath_chorm)
     idxchrom += 1
     del tensordict, tensordict_tune
@@ -1369,6 +1252,8 @@ def train_step(tensordict_all, net, optimizer, chrom, rm_epochs,
 
 
 def plot_epoch_perf(curlogpath):
+    if not os.path.exists(curlogpath):
+        return
     imgpath = curlogpath.replace(".tsv", ".png")
     pdfpath = curlogpath.replace(".tsv", ".pdf")
     logdf = pd.read_csv(curlogpath, sep="\t")
@@ -1434,7 +1319,7 @@ def merge_batches(list_tensordicts, list_resp_cutoffs):
     return tensordict, out_av
 
 
-def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
+def main(outdir, mavepath, rnabwpaths, dnasebwpaths,
          bulkdnasepath, bedpath, batchsize,
          seqdir, mask_nonpeaks, train_chroms,
          modelparams, window=10000, regression=False, maxepoch=100,
@@ -1454,7 +1339,7 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
     modelpath_bestloss = dictpaths["modelpath_bestloss"]
     resp_thresh = modelparams["RESP_THRESH"]
     check_paths = [modelpath, modelpath_bestloss] + chkpaths
-    scvi = load_scvidf(scvipath)
+    mave = load_mavedf(mavepath)
     if os.path.exists(pretrained_path):
         check_paths = [pretrained_path]
         print("Will not load check points, will use pre-trained")
@@ -1489,7 +1374,7 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
                 rnabwpaths, dnasebwpaths,
                 bulkdnasepath, bedpath, batchsize,
                 seqdir, mask_nonpeaks, chrom,
-                scvi, regression=regression,
+                mave, regression=regression,
                 force_tissue_negatives=True,
                 dont_train=dont_train,
                 SCALE_FACTORS=SCALE_FACTORS,
@@ -1525,7 +1410,7 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
                 augmentations=augmentations)
             adname_char = "{}_{}".format(
                 "TrainingPerformance_contrastive", chrom_str)
-            apply_model(
+            _ = apply_model(
                 tensordict_all, net, adname_char,
                 logdir, idxchrom, criterion,
                 resp_cutoff=resp_cutoff)
@@ -1534,9 +1419,9 @@ def main(outdir, scvipath, rnabwpaths, dnasebwpaths,
                 logdir, "{}_fullChromPerf_{}.tsv.gz".format(
                     chrom_str, cur_chroms[0]))
             main_predict(outpath_pred, rnabwpaths[0], bulkdnasepath,
-                         bedpath, dnasebwpaths[0], rnabwpaths[0],
+                         bedpath, bulkdnasepath, rnabwpaths[0],
                          modelpath_bestloss, 16, seqdir,
-                         False, scvipath, vae_names[0],
+                         False, mavepath, vae_names[0],
                          dnasebwpaths[0], SCALE_FACTORS, scale_operation,
                          chrom=cur_chroms[0], input_normalize=input_normalize)
         idxchrom += 1
@@ -1565,7 +1450,7 @@ def get_scale_factors(bwpaths, chrom):
 def get_batch(rnabwpaths,
               dnasebwpaths, bulkdnasepath, bedpath,
               batchsize, seqdir, mask_nonpeaks,
-              chrom, scvi,
+              chrom, mave,
               window=10000, regression=False,
               force_tissue_negatives=False,
               dont_train=False,
@@ -1573,7 +1458,7 @@ def get_batch(rnabwpaths,
               SCALE_OP="identity",
               RESP_THRESH=0.2,
               vae_names=["NA"],
-              num_scvi_samples=32, arcsinh=False,
+              num_mave_samples=32, arcsinh=False,
               num_contrastive_regions=[700, 400],
               input_normalize="None"):
     if vae_names[0] == "NA":
@@ -1610,9 +1495,9 @@ def get_batch(rnabwpaths,
     response = np.zeros(
         (TOTBATCHIDX, 1),
         dtype=int)
-    scvimat = np.zeros(
+    mavemat = np.zeros(
         (TOTBATCHIDX,
-         list(scvi.values())[0].shape[0]))
+         list(mave.values())[0].shape[0]))
     if regression:
         response = np.zeros(
             (TOTBATCHIDX, 1),
@@ -1629,13 +1514,21 @@ def get_batch(rnabwpaths,
     i_st = 0
     i_end = 0
     # num_batches = batchsize * 200
+    dict_temp = {}
+    for j in range(len(rnabwpaths)):
+        print("Loading signal {}/{}".format(j, len(rnabwpaths)))
+        rna, dnase, positions, avg_dnase, resp = DataObj.get_batches(
+            regions_to_use[:, 0], regions_to_use[:, 1], rnabwpaths[j],
+            dnasebwpaths[j], SCALE_FACTORS)
+        dict_temp[j] = {"rna": rna, "dnase": dnase, "positions": positions,
+                        "avg_dnase": avg_dnase, "resp": resp}
     for i in range(num_batches):
         idx_st = i * batchsize
         idx_end = (i + 1) * batchsize
         if idx_end > regions_to_use.shape[0]:
             idx_end = regions_to_use.shape[0]
         start_poses = regions_to_use[idx_st:idx_end, 0]
-        end_poses = regions_to_use[idx_st:idx_end, 1]
+        # end_poses = regions_to_use[idx_st:idx_end, 1]
         curbatchsize = idx_end - idx_st
         for j in range(len(rnabwpaths)):
             i_end = i_st + len(start_poses)
@@ -1643,9 +1536,14 @@ def get_batch(rnabwpaths,
                 i_end = train1.shape[0]
             # adname = os.path.basename(rnabwpaths[j])
             adname = vae_names[j]
-            rna, dnase, positions, avg_dnase, resp = DataObj.get_batches(
-                start_poses, end_poses, rnabwpaths[j],
-                dnasebwpaths[j], SCALE_FACTORS)
+            rna = dict_temp[j]["rna"][idx_st:idx_end]
+            dnase = dict_temp[j]["dnase"][idx_st:idx_end]
+            positions = dict_temp[j]["positions"][idx_st:idx_end]
+            avg_dnase = dict_temp[j]["avg_dnase"][idx_st:idx_end]
+            resp = dict_temp[j]["resp"][idx_st:idx_end]
+            # rna, dnase, positions, avg_dnase, resp = DataObj.get_batches(
+            #     start_poses, end_poses, rnabwpaths[j],
+            #     dnasebwpaths[j], SCALE_FACTORS)
             # resp_cutoff = 0.5 * SCALE_FACTORS[1]
             # resp[resp < resp_cutoff] = 0
             try:
@@ -1678,16 +1576,16 @@ def get_batch(rnabwpaths,
                 raise ValueError("")
             averages[i_st:i_end, 0] = avg_dnase[:curbatchsize]
             samples[i_st:i_end] = np.array([adname] * curbatchsize)
-            if len(list(scvi.keys())) > 100:
+            if len(list(mave.keys())) > 100:
                 for l in range(i_st, i_end):
                     rand_num = np.random.choice(
-                        np.arange(num_scvi_samples), 1)[0]
+                        np.arange(num_mave_samples), 1)[0]
                     adname_temp = adname + ".{}".format(rand_num)
-                    scvimat[l, :] = np.array(
-                        scvi[adname_temp])
+                    mavemat[l, :] = np.array(
+                        mave[adname_temp])
             else:
-                scvimat[i_st:i_end, :] = np.array(
-                    scvi[adname])
+                mavemat[i_st:i_end, :] = np.array(
+                    mave[adname])
             i_st = i_end
         if i % 10 == 0:
             print("{}/{} regions added".format(i_st, TOTBATCHIDX))
@@ -1709,7 +1607,7 @@ def get_batch(rnabwpaths,
         "Samples": samples[idx_sort_regions],
         "Tissues": samples[idx_sort_regions],
         "Response": response[idx_sort_regions],
-        "scVI": scvimat[idx_sort_regions]}
+        "mave": mavemat[idx_sort_regions]}
     tensordict["Resp.Diff"] = \
         tensordict["Response"] - tensordict["Averages"]
     return tensordict, resp_cutoff, DataObj.bed
@@ -1775,7 +1673,7 @@ if __name__ == "__main__":
         help="Path to directory for saving "
         "model training logs")
     parser.add_argument(
-        "scvipath",
+        "mavepath",
         help="Path to the matrix of SCVI averaged data")
     parser.add_argument(
         "bedpath",
@@ -1912,8 +1810,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--window",
         type=int,
-        help="Genomic region size. Def. 20000",
-        default=20000)
+        help="Genomic region size. Def. 10000",
+        default=10000)
     parser.add_argument(
         "--filter-rate",
         type=float,
@@ -2036,7 +1934,7 @@ if __name__ == "__main__":
         if not os.path.exists(eachpath):
             print("{} doesn't exist!".format(eachpath))
             raise ValueError("Check LOG! Can't access file")
-    main(args.outdir, args.scvipath, args.rnabwpaths,
+    main(args.outdir, args.mavepath, args.rnabwpaths,
          args.dnasebwpaths, args.bulkdnasepath, args.bedpath,
          args.batchsize, args.seqdir,
          args.mask_nonpeaks, args.chroms,
